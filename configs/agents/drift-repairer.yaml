@@ -1,0 +1,19 @@
+agent: drift-repairer
+model: codex:gpt-6-astra      # through the user's ChatGPT subscription; or api:openai
+effort: high                  # low | medium | high | xhigh | max
+skills: [read-model-atlas, localize-safety-drift, select-recover-method, direct-edit-repair, reward-hack-self-audit]
+tools: [inspect.*, localize.*, repair.*, edit.*, measure.dev_eval]
+budgets:
+  code_runs: 120
+  forward_passes: 50
+  dev_prompts: 600
+  gpu_seconds: 3600           # localize tools
+  submissions: 6
+max_turns: 160
+handoff_every: 40
+reference_models:
+  base: CohereLabs/tiny-aya-base
+  aligned: CohereLabs/tiny-aya-global
+  drifted: <our-org>/tiny-aya-global-drifted-d3
+recipe: safety-drift-repair
+grader: safety-drift-repair@5   # pinned version, read-only for the agent

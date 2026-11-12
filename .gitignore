@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+runs/
+atlas/
+sealed/
+*.safetensors
+.env
+.codex-home/
+node_modules/
+dist/
