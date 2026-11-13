@@ -226,6 +226,9 @@ def grade_reference(spec_yaml: str, which: str = "oracle") -> dict:
         raise ValueError(which)
     before = w.session.fraction_changed()
     feedback = t.measure.submit(note=which)
+    Path(f"/runs/grade-{which}/result.json").write_text(json.dumps(
+        {"which": which, "fraction_changed": before, "feedback": feedback, "verdict": w.verdicts[-1],
+         "judges": getattr(w, "judges_label", "")}, indent=2, default=str))
     runs.commit()
     return json.loads(json.dumps({"which": which, "fraction_changed": before, "feedback": feedback,
                                   "verdict": w.verdicts[-1], "judges": getattr(w, "judges_label", "")}, default=str))

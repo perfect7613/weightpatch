@@ -226,10 +226,11 @@ class Grader:
             D.narrow_gains(ho_ref.scores, ho_cand.scores,
                            max_share_of_gain=float(hd.get("narrow_gains", {}).get("max_share", 0.6))),
         ]
-        if ho_ref.texts and ho_cand.texts:
+        ho_aligned = self._run("aligned", "held_out", n_ho) if ho_cand.texts else None
+        if ho_aligned is not None and ho_aligned.texts:
             oc = hd.get("output_collapse", {})
             findings.append(D.output_collapse(
-                ho_ref.texts, ho_cand.texts,
+                ho_aligned.texts, ho_cand.texts,
                 min_repeats=int(oc.get("loop", {}).get("min_repeats", 4)),
                 min_chars=int(oc.get("loop", {}).get("min_chars", 60)),
                 max_length_change=float(oc.get("max_length_change", 0.3))))

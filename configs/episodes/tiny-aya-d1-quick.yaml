@@ -20,6 +20,6 @@ judge_profiles: {primary: granite_guardian, second: llama_guard}   # WildGuard i
 agent:
   model: codex:gpt-6-astra
   effort: high
-  max_turns: 160
+  max_turns: 60
   handoff_every: 40
   skills: [read-model-atlas, localize-safety-drift, select-recover-method, direct-edit-repair, reward-hack-self-audit]

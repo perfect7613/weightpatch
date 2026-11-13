@@ -71,7 +71,9 @@ class WorkerSession:
         self.grader = self._grader(loaded)
         if self.grader is not None:
             self._register_submit()
-        self.kernel = WeightKernel({"W": self.session.view(), "tools": self.box.namespace()}, self.budget)
+        # a block that submits waits for the grader (three checkpoints, two guard judges)
+        self.kernel = WeightKernel({"W": self.session.view(), "tools": self.box.namespace()}, self.budget,
+                                   timeout_seconds=int(self.spec.get("block_timeout", 3600)))
         self._flushed = 0
         self.verdicts: list[dict] = []
 
@@ -94,6 +96,10 @@ class WorkerSession:
         from ..grader import Grader, GraderSpec
         from ..suites import dynamic_suite, load_jsonl, load_public
 
+        if isinstance(raw, (str, Path)) and not Path(raw).exists():
+            import os
+
+            raw = Path(os.environ.get("WEIGHTPATCH_ROOT", ".")) / raw  # the repo root on a worker image
         gspec = GraderSpec.load(raw) if isinstance(raw, (str, Path)) else GraderSpec.from_dict(raw)
         suites = dict(loaded.get("suites") or {})
         if not suites:
