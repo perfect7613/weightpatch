@@ -143,13 +143,14 @@ SOURCES: dict[str, tuple[str, int, list]] = {
 }
 
 
-def load_public(name: str, n: int, seed: int = 0, pool: int | None = None) -> Suite:
+def load_public(name: str, n: int, seed: int = 0, pool: int | None = None, offset: int = 0,
+                as_name: str | None = None) -> Suite:
     """Load ``n`` items of a public suite. The first ``pool`` rows are read
     (default 4n, at least 400), shuffled with ``seed`` and cut to ``n``."""
     if name not in SOURCES:
         raise KeyError(f"unknown suite {name!r}; known: {sorted(SOURCES)}")
     kind, max_new, alternates = SOURCES[name]
-    want, errors = pool or max(4 * n, 400), []
+    want, errors = pool or max(4 * (n + offset), 400), []
     for loader, reader in alternates:
         try:
             rows = []
@@ -157,15 +158,33 @@ def load_public(name: str, n: int, seed: int = 0, pool: int | None = None) -> Su
                 rows.append(row)
                 if len(rows) >= want:
                     break
-            if len(rows) < n:
+            if len(rows) < n + offset:
                 raise ValueError(f"only {len(rows)} usable rows")
         except Exception as e:  # gated, moved or renamed: try the next source
             errors.append(f"{type(e).__name__}: {str(e)[:120]}")
             continue
         random.Random(seed).shuffle(rows)
-        items = [Item(f"{name}-{i}", r["prompt"], r.get("target")) for i, r in enumerate(rows[:n])]
-        return Suite(name, kind, items, max_new)
+        # `offset` gives disjoint slices of one source: dev from [0, n), held-out from [n, ...)
+        items = [Item(f"{name}-{offset + i}", r["prompt"], r.get("target"))
+                 for i, r in enumerate(rows[offset:offset + n])]
+        return Suite(as_name or name, kind, items, max_new)
     raise RuntimeError(f"no source for suite {name!r} could be read: {errors}")
+
+
+def suite_from(ref, name: str, default_n: int = 64, seed: int = 0) -> Suite:
+    """A suite from an episode-spec entry: a public suite name, or
+    ``{public, n, offset, pool, seed}`` (a slice of a public suite; give every
+    slice of one source the same ``pool`` and ``seed`` so slices are disjoint),
+    or ``{jsonl, kind, n}`` (a sealed file on the worker)."""
+    if isinstance(ref, str):
+        ref = {"public": ref}
+    if "jsonl" in ref:
+        return load_jsonl(ref["jsonl"], name, ref.get("kind", "harm"), n=ref.get("n"), seed=ref.get("seed", seed))
+    st = load_public(ref["public"], int(ref.get("n", default_n)), ref.get("seed", seed), pool=ref.get("pool"),
+                     offset=int(ref.get("offset", 0)), as_name=name)
+    if ref.get("kind"):
+        st.kind = ref["kind"]
+    return st
 
 
 def load_jsonl(path: str | Path, name: str, kind: str, n: int | None = None, seed: int = 0,
@@ -253,8 +272,8 @@ def _augmenters() -> dict[str, Callable[[str, random.Random], str]]:
 def dynamic_suite(pool: Sequence[Item], n: int, round_seed: int,
                   augmentations: Sequence[str] = ("word_scramble", "random_capitalization", "ascii_noise"),
                   exclude: Sequence[str] = (), rewrite: Callable[[str, str], str] | None = None,
-                  rewrite_kinds: Sequence[str] = (), n_rewrites: int = 0) -> Suite:
-    """A fresh harm suite for one grading round: ``n`` perturbed variants of
+                  rewrite_kinds: Sequence[str] = (), n_rewrites: int = 0, kind: str = "harm") -> Suite:
+    """A fresh suite (of the pool's kind) for one grading round: ``n`` perturbed variants of
     sealed prompts, plus ``n_rewrites`` model-written rewrites (paraphrase,
     translation, code-mixing) when a ``rewrite(prompt, kind)`` function is
     given. Variants equal to a prompt in ``exclude`` (dev or held-out) are
@@ -266,20 +285,20 @@ def dynamic_suite(pool: Sequence[Item], n: int, round_seed: int,
         if len(items) >= n:
             break
         src = order[i % len(order)]
-        kind = augmentations[i % len(augmentations)]
-        text = fns[kind](src.prompt, rng)
+        aug = augmentations[i % len(augmentations)]
+        text = fns[aug](src.prompt, rng)
         if text in seen:
             continue
         seen.add(text)
-        items.append(Item(f"dyn-{round_seed}-{len(items)}", text, meta={"from": src.id, "augmentation": kind}))
+        items.append(Item(f"dyn-{round_seed}-{len(items)}", text, meta={"from": src.id, "augmentation": aug}))
     if rewrite is not None:
         for i in range(n_rewrites):
-            src, kind = order[(n + i) % len(order)], rewrite_kinds[i % len(rewrite_kinds)]
-            text = rewrite(src.prompt, kind)
+            src, rk = order[(n + i) % len(order)], rewrite_kinds[i % len(rewrite_kinds)]
+            text = rewrite(src.prompt, rk)
             if text and text not in seen:
                 seen.add(text)
-                items.append(Item(f"dyn-{round_seed}-{len(items)}", text, meta={"from": src.id, "rewrite": kind}))
-    return Suite("dynamic", "harm", items, 128)
+                items.append(Item(f"dyn-{round_seed}-{len(items)}", text, meta={"from": src.id, "rewrite": rk}))
+    return Suite("dynamic", kind, items, 128)
 
 
-__all__ = ["Item", "Suite", "SOURCES", "load_public", "load_jsonl", "dynamic_suite", "mcq_prompt", "LETTERS"]
+__all__ = ["Item", "Suite", "SOURCES", "load_public", "load_jsonl", "suite_from", "dynamic_suite", "mcq_prompt", "LETTERS"]

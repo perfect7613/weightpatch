@@ -57,6 +57,7 @@ class KitContext:
 
     ctx: ToolContext
     base: Mapping[str, torch.Tensor] | None = None  # the checkpoint the aligned model was tuned from
+    aligned: Mapping[str, torch.Tensor] | None = None  # the aligned checkpoint; default: the tool context's reference
     workdir: Path | None = None  # scratch space on the worker for CircuitKIT artifacts
     refusal_token: str = " I"  # first token of a refusal / of a compliant answer,
     compliance_token: str = " Sure"  # for CircuitKIT's logit-difference metric
@@ -88,7 +89,7 @@ class KitContext:
     def module(self, which: str):
         """The aligned or base checkpoint as a module (built once, kept)."""
         if which not in self._modules:
-            state = self.ctx.need_reference() if which == "aligned" else self.base
+            state = self.aligned_state() if which == "aligned" else self.base
             if state is None:
                 raise RuntimeError(f"this episode has no {which} checkpoint")
             m = copy.deepcopy(self.runner.model)
@@ -115,8 +116,12 @@ class KitContext:
         self._modules.clear()
         self._tl.clear()
 
-    def prompts(self, n: int) -> tuple[list[str], list[str]]:
-        harmful, benign = list(self.ctx.dev.harmful[:n]), list(self.ctx.dev.benign[:n])
+    def aligned_state(self) -> Mapping[str, torch.Tensor]:
+        return self.aligned if self.aligned is not None else self.ctx.need_reference()
+
+    def prompts(self, n: int, a: str = "harmful", b: str = "benign") -> tuple[list[str], list[str]]:
+        """Two dev sets as a contrast pair, cut to equal length."""
+        harmful, benign = self.ctx.dev.get(a, n), self.ctx.dev.get(b, n)
         k = min(len(harmful), len(benign))
         if k == 0:
             raise RuntimeError("this episode has no dev prompts")
@@ -192,16 +197,18 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
         return nullcontext(kit.module(which))
 
     # ---------------- localize ----------------
-    def safety_direction(n: int = 32, pick_layer: int | None = None, on: str = "candidate") -> dict:
+    def safety_direction(n: int = 32, pick_layer: int | None = None, on: str = "candidate",
+                         a: str = "harmful", b: str = "benign") -> dict:
         """SafeTune refusal direction (difference of means, with SafeTune's layer
-        selection sweep). `on` is "candidate", "aligned" or "base".
+        selection sweep) between dev sets `a` and `b` (default harmful vs benign;
+        any two sets of this run work). `on` is "candidate", "aligned" or "base".
         Returns {layer, direction [d], per_layer {layer: [d]}}. Compare the
         candidate's direction with the aligned model's: where they disagree is
         where the drift sits."""
         from safetune.interventions.steer.refusal_direction import (
             RefusalDirectionConfig, extract_refusal_direction)
 
-        harmful, benign = kit.prompts(n)
+        harmful, benign = kit.prompts(n, a, b)
         cfg = RefusalDirectionConfig(pick_layer=pick_layer, n_val=min(16, max(1, len(harmful) // 2)))
         with _on(on) as model:
             direction, layer, per_layer = extract_refusal_direction(
@@ -212,17 +219,20 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
         return out
 
     def safety_neurons(method: str = "activation", top_k: int = 16, layers: Sequence[int] | None = None,
-                       module: str = "mlp.down_proj", on: str = "aligned", n: int = 32) -> dict:
+                       module: str = "mlp.down_proj", on: str = "aligned", n: int = 32,
+                       a: str = "harmful", b: str = "benign") -> dict:
         """SafeTune safety neurons, the fine-grained rung. method="weight" ranks
         MLP neurons by how strongly their output weights write the refusal
         direction; method="activation" ranks them by how differently they fire on
-        harmful and benign prompts. `on` is "aligned" (where the safety lives),
+        the two dev sets `a` and `b` (default harmful vs benign; use e.g.
+        a="borderline", b="benign" to find what drives refusals of safe requests).
+        `on` is "aligned" (the released model, where the behaviour lives),
         "candidate" or "base". Returns {circuit, units {layer: [neuron]}, ...};
         pass `circuit` to repair.ctheta, or use `units` as column indices of
         model.layers.<layer>.mlp.down_proj.weight for a direct edit."""
         from safetune.instrumentation.interpret.safety_neurons import safety_circuit_info
 
-        harmful, benign = kit.prompts(n)
+        harmful, benign = kit.prompts(n, a, b)
         with _on(on) as model:
             info = safety_circuit_info(
                 model, kit.runner.tokenizer, harmful, benign, top_k_per_layer=top_k, target_module=module,
@@ -235,7 +245,7 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
         return out
 
     def eap_circuit(method: str = "eap-ig", top_k: int = 64, n: int = 16, granularity: str = "head",
-                    ig_steps: int = 5, on: str = "candidate") -> dict:
+                    ig_steps: int = 5, on: str = "candidate", a: str = "harmful", b: str = "benign") -> dict:
         """SafeTune native EAP / EAP-IG safety circuit: attribution of the
         comply-versus-refuse logit difference to every attention head and MLP
         block. Attribution uses gradients inside this tool; nothing is trained.
@@ -243,7 +253,7 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
         names are blocks.<L>.attn.head<H> and blocks.<L>.mlp."""
         from safetune.instrumentation.interpret.eap import EAPSafetyCircuitConfig, eap_safety_circuit
 
-        harmful, benign = kit.prompts(n)
+        harmful, benign = kit.prompts(n, a, b)
         cfg = EAPSafetyCircuitConfig(method=method, top_k_edges=top_k, granularity=granularity, ig_steps=ig_steps,
                                      batch_size=min(8, len(harmful)))
         with _on(on) as model, torch.enable_grad():
@@ -374,7 +384,7 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
         checkpoint. Use when a small set of neurons carries the drift."""
         from safetune.runner.recover import NLSRTrainer
 
-        return _apply("nlsr", lambda m: NLSRTrainer(m, donor_state=dict(ctx.need_reference()), blend=blend),
+        return _apply("nlsr", lambda m: NLSRTrainer(m, donor_state=dict(kit.aligned_state()), blend=blend),
                       evidence, blend=blend)
 
     def mscp(evidence: str, coefficient: float = 0.05) -> dict:
@@ -385,7 +395,7 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
         if kit.base is None:
             raise RuntimeError("this episode has no base checkpoint")
         return _apply("mscp", lambda m: MSCPTrainer(
-            m, aligned_state=dict(ctx.need_reference()), base_state=dict(kit.base), coefficient=coefficient),
+            m, aligned_state=dict(kit.aligned_state()), base_state=dict(kit.base), coefficient=coefficient),
             evidence, coefficient=coefficient)
 
     def methods() -> list[dict]:
@@ -454,7 +464,7 @@ def _register_circuitkit(box: ToolBox, kit: KitContext) -> None:
         kit._tl[key] = ck.load_model(str(path), dtype=dtype)
         return kit._tl[key]
 
-    def _register_task(task: str, n: int) -> str:
+    def _register_task(task: str, n: int, a: str = "harmful", b: str = "benign") -> str:
         """Make `task` known to CircuitKIT. "dev" is built from this episode's
         own contrast prompts, so the circuit is about the same behaviour the
         other localizers measured (and no gated dataset is needed)."""
@@ -469,9 +479,9 @@ def _register_circuitkit(box: ToolBox, kit: KitContext) -> None:
         from circuitkit.data.normalized_task import NormalizedTaskSpec
         from circuitkit.tasks.registry import is_task_registered, register_task
 
-        name = f"weightpatch_dev_{id(kit) & 0xFFFFFF:x}"
+        name = f"weightpatch_dev_{a}_{b}_{id(kit) & 0xFFFFFF:x}"
         if not is_task_registered(name):
-            harmful, benign = kit.prompts(max(n, 8))
+            harmful, benign = kit.prompts(max(n, 8), a, b)
             ds = SafetyPromptAdapter().adapt(
                 [{"prompt": p} for p in harmful], name=name, source="episode dev set", benign_controls=benign,
                 pairing_mode="harmful_vs_benign", refusal_token=kit.refusal_token,
@@ -481,7 +491,7 @@ def _register_circuitkit(box: ToolBox, kit: KitContext) -> None:
 
     def discover_circuit(task: str = "dev", algorithm: str = "eap-ig", level: str = "node",
                          n_examples: int = 64, sparsity: float = 0.3, scope: str = "both",
-                         on: str = "candidate") -> dict:
+                         on: str = "candidate", a: str = "harmful", b: str = "benign") -> dict:
         """CircuitKIT circuit discovery: which attention heads and MLPs, or with
         level="neuron" which neurons, carry the refuse-versus-comply behaviour.
         task="dev" uses this episode's harmful and benign dev prompts; harmbench,
@@ -496,7 +506,7 @@ def _register_circuitkit(box: ToolBox, kit: KitContext) -> None:
         # CircuitKIT caches normalised task data under the working directory, at
         # registration and again at discovery: do both from the worker's scratch
         with contextlib.chdir(_workdir()), torch.enable_grad():
-            task = _register_task(task, n_examples)
+            task = _register_task(task, n_examples, a, b)
             out_path = _workdir() / f"{task}-{algorithm}-{level}-{on}-{len(kit.circuits) + 1}.pt"
             circuit = ck.discover(_hooked(on), task, algorithm=algorithm, level=level, n_examples=n_examples,
                                   sparsity=sparsity, scope=scope, output_path=str(out_path))

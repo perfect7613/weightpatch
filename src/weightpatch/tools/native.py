@@ -37,19 +37,32 @@ class DevSet:
 
     harmful: Sequence[str] = ()
     benign: Sequence[str] = ()
+    extra: Mapping[str, Sequence[str]] = field(default_factory=dict)  # more named sets, e.g. "borderline"
+    expect: Mapping[str, str] = field(default_factory=dict)  # set -> "refuse" | "answer": what a good model does
+
+    def sets(self) -> dict[str, Sequence[str]]:
+        out = {"harmful": self.harmful, "benign": self.benign, **dict(self.extra)}
+        return {k: v for k, v in out.items() if len(v)}
+
+    def get(self, name: str, n: int | None = None) -> list[str]:
+        sets = self.sets()
+        if name not in sets:
+            raise KeyError(f"no dev set {name!r}; this run has: {sorted(sets)}")
+        return list(sets[name][:n] if n is not None else sets[name])
 
 
 @dataclass
 class ToolContext:
     session: EditSession
-    reference: Mapping[str, torch.Tensor] | None = None  # the aligned checkpoint
+    reference: Mapping[str, torch.Tensor] | None = None  # the checkpoint tools compare against
+    reference_name: str = "aligned"  # what it is: "aligned" in a repair, "base" when improving a released model
     runner: ForwardRunner | None = None
     dev: DevSet = field(default_factory=DevSet)
     findings: list[dict] = field(default_factory=list)  # flushed to the atlas
 
     def need_reference(self) -> Mapping[str, torch.Tensor]:
         if self.reference is None:
-            raise RuntimeError("this episode has no aligned reference checkpoint")
+            raise RuntimeError("this episode has no reference checkpoint")
         return self.reference
 
     def need_runner(self) -> ForwardRunner:
@@ -71,7 +84,7 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         return {n: tuple(s.baseline[n].shape) for n in s.names(pattern)}
 
     def diff_weights(pattern: str = "*", top: int = 20) -> list[dict]:
-        """Drift map: current weights minus the aligned reference, per tensor.
+        """Drift map: current weights minus the reference checkpoint, per tensor.
         Returns the `top` tensors by relative change, each with
         name, diff_norm, rel_change (diff_norm / reference norm)."""
         ref = ctx.need_reference()
@@ -103,26 +116,28 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
     box.register("inspect", svd_of_diff)
 
     # ---------------- localize ----------------
-    def refusal_direction(layers: Sequence[int] | None = None, n: int = 32) -> dict[int, torch.Tensor]:
-        """Difference of mean last-position states, harmful minus harmless dev
-        prompts, as a unit vector per layer. One forward pass."""
+    def refusal_direction(layers: Sequence[int] | None = None, n: int = 32, a: str = "harmful",
+                          b: str = "benign") -> dict[int, torch.Tensor]:
+        """Difference of mean last-position states between two dev sets, `a`
+        minus `b`, as a unit vector per layer. The default is harmful minus
+        benign (the refusal direction); with other sets it is the direction
+        that separates them (e.g. a="borderline", b="benign"). One forward pass."""
         runner = ctx.need_runner()
         layers = list(layers) if layers is not None else list(range(runner.n_layers))
-        h = runner.hidden(list(ctx.dev.harmful[:n]), layers).mean(0)
-        b = runner.hidden(list(ctx.dev.benign[:n]), layers).mean(0)
+        h = runner.hidden(ctx.dev.get(a, n), layers).mean(0)
+        g = runner.hidden(ctx.dev.get(b, n), layers).mean(0)
         out = {}
         for i, layer in enumerate(layers):
-            d = h[i] - b[i]
+            d = h[i] - g[i]
             out[layer] = d / (d.norm() + 1e-12)
-        ctx.findings.append({"tool": "localize.refusal_direction", "layers": layers, "n": n})
+        ctx.findings.append({"tool": "localize.refusal_direction", "a": a, "b": b, "layers": len(layers), "n": n})
         return out
 
     def rank_writers(direction: torch.Tensor, pattern: str = "*", top: int = 20, against_reference: bool = False) -> list[dict]:
         """Which columns write a residual direction most. For every 2-D tensor
         matching `pattern` whose output size equals len(direction), scores each
         column j by direction . W[:, j]. With against_reference=True the score is
-        the change in that projection relative to the aligned model, which
-        points at columns the drift altered. No forward pass."""
+        the change in that projection relative to the reference checkpoint. No forward pass."""
         u = direction.float().flatten()
         u = u / (u.norm() + 1e-12)
         ref = ctx.need_reference() if against_reference else None
@@ -153,7 +168,7 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
     # ---------------- edit ----------------
     def restore_from_reference(name: str, cols: Sequence[int] | None = None, rows: Sequence[int] | None = None,
                                scale: float = 1.0, evidence: str = "") -> dict:
-        """Move chosen columns and/or rows of one tensor back toward the aligned
+        """Move chosen columns and/or rows of one tensor back toward the
         reference: W[sel] += scale * (W_ref[sel] - W[sel]). Give cols or rows
         (or both); whole-tensor restores hit the edit cap."""
         ref = ctx.need_reference()[name].float()
@@ -195,25 +210,31 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
     box.register("edit", list_edits)
 
     # ---------------- measure ----------------
-    def dev_eval(n: int = 32, max_new_tokens: int = 48) -> dict:
-        """Refusal rates on visible dev prompts with the current edits applied,
+    def dev_eval(n: int = 32, max_new_tokens: int = 48, sets: Sequence[str] | None = None) -> dict:
+        """Refusal rate on each visible dev set with the current edits applied,
         by string match (noisy; the grader uses judges). Returns
-        harmful_refusal_rate (want high) and benign_refusal_rate (want low)."""
+        {"<set>_refusal_rate": rate, "n_<set>": count}. The run facts say which
+        sets a good model refuses and which it answers."""
         runner = ctx.need_runner()
-        harmful, benign = list(ctx.dev.harmful[:n]), list(ctx.dev.benign[:n])
-        hr = [looks_like_refusal(t) for t in runner.generate(harmful, max_new_tokens)]
-        br = [looks_like_refusal(t) for t in runner.generate(benign, max_new_tokens)]
-        return {
-            "n_harmful": len(hr), "n_benign": len(br),
-            "harmful_refusal_rate": sum(hr) / max(len(hr), 1),
-            "benign_refusal_rate": sum(br) / max(len(br), 1),
-        }
+        out: dict = {}
+        for name in (list(sets) if sets is not None else list(ctx.dev.sets())):
+            prompts = ctx.dev.get(name, n)
+            refused = [looks_like_refusal(t) for t in runner.generate(prompts, max_new_tokens)]
+            out[f"n_{name}"] = len(refused)
+            out[f"{name}_refusal_rate"] = sum(refused) / max(len(refused), 1)
+        return out
+
+    def dev_prompts(name: str, n: int = 8) -> list[str]:
+        """The first `n` prompts of a dev set, to read what the set contains."""
+        return ctx.dev.get(name, n)
 
     def sample(prompts: Sequence[str], max_new_tokens: int = 64) -> list[str]:
         """Greedy completions for your own prompts with the current edits."""
         return ctx.need_runner().generate(list(prompts), max_new_tokens)
 
-    box.register("measure", dev_eval, cost=lambda n=32, **_: {"forward_passes": 1, "dev_prompts": 2 * n}, timed=True)
+    box.register("measure", dev_eval, cost=lambda n=32, sets=None, **_: {
+        "forward_passes": 1, "dev_prompts": n * len(sets if sets is not None else ctx.dev.sets())}, timed=True)
+    box.register("measure", dev_prompts)
     box.register("measure", sample, cost=lambda prompts, **_: {"forward_passes": 1, "dev_prompts": len(prompts)}, timed=True)
 
 

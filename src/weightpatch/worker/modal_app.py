@@ -177,6 +177,58 @@ def smoke(aligned: str = "CohereLabs/tiny-aya-global", base: str = "CohereLabs/t
     return json.loads(json.dumps(out, default=str))
 
 
+PROFILE_SUITES = ("harmbench_dev", "xstest_safe", "orbench_hard", "jbb_benign", "mmlu", "milu_hi", "medmcqa")
+
+
+@app.function(**GPU_KW)
+def profile(model: str = "CohereLabs/tiny-aya-global", n: int = 100, name: str = "profile") -> dict:
+    """Where does a model, as released, have room to improve? Measures harm
+    (plain, held-out and perturbed prompts), refusals on safe prompts, and
+    capability, with the same suites and judges the grader uses."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from weightpatch.edits import EditSession
+    from weightpatch.evaluator import AuditKitEvaluator, guard_judges
+    from weightpatch.grader.detectors import is_looping, wilson
+    from weightpatch.runner import HFRunner
+    from weightpatch.suites import dynamic_suite, load_jsonl, load_public
+
+    tok = AutoTokenizer.from_pretrained(model)
+    m = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16).to("cuda").eval()
+    session = EditSession({k: v.detach().cpu() for k, v in m.named_parameters()})
+    runner = HFRunner(m, tok, session, batch_size=16)
+    suites = {}
+    for s_name in PROFILE_SUITES:
+        try:
+            suites[s_name] = load_public(s_name, n)
+        except Exception as e:
+            print("skip", s_name, str(e)[:200], flush=True)
+    suites["held_out"] = load_jsonl("/runs/sealed/heldout_pool.jsonl", "held_out", "harm", n=n)
+    suites["perturbed"] = dynamic_suite(suites["held_out"].items, n, round_seed=1)
+    ev = AuditKitEvaluator(runner, {}, suites, guard_judges("granite_guardian", "llama_guard",
+                                                           {"dtype": "bfloat16", "device_map": "cuda"}))
+    out = {"model": model, "n": n, "suites": {}}
+    for s_name, st in suites.items():
+        run = ev.run("candidate", s_name, min(n, len(st.items)))
+        k, total = sum(run.scores), len(run.scores)
+        lo, hi = wilson(int(k), total)
+        row = {"kind": st.kind, "rate": round(k / total, 3), "ci": [round(lo, 3), round(hi, 3)], "n": total,
+               "looping": round(sum(is_looping(t) for t in run.texts) / total, 3),
+               "mean_chars": round(sum(len(t) for t in run.texts) / total)}
+        if run.second:
+            row["second_judge_rate"] = round(sum(run.second) / total, 3)
+        flagged = [(st.items[i].prompt, run.texts[i]) for i, sc in enumerate(run.scores)
+                   if (sc > 0.5) == (st.kind != "capability")]
+        row["examples"] = [{"prompt": p[:200], "answer": a[:200]} for p, a in flagged[:5]]
+        out["suites"][s_name] = row
+        print("PROFILE", s_name, json.dumps({k2: v for k2, v in row.items() if k2 != "examples"}), flush=True)
+    Path(f"/runs/{name}").mkdir(parents=True, exist_ok=True)
+    Path(f"/runs/{name}/profile.json").write_text(json.dumps(out, indent=2))
+    runs.commit()
+    return out
+
+
 # ------------------------------------------------------------------- drift
 @app.function(**GPU_KW)
 def build_drift(tier: str = "d1", aligned: str = "CohereLabs/tiny-aya-global", n: int = 256,
