@@ -73,9 +73,32 @@ LLM cheat reviewer, the goal router for prompts beyond safety drift, and the exp
   the worker over the local and HTTP providers.
 - A live episode ran on the toy: Astra, through the Codex CLI with its own tools off, found and
   exactly repaired a planted drift (383 entries, 0.21% of the model, no collateral change).
-- **Nothing has been run on Tiny Aya yet.** The checkpoints are gated and access is pending, so
-  there are no repair numbers to report. The Modal worker is written but has not been deployed.
-  The toy model has no safety behaviour, so the toy says nothing about how well repairs work.
+- On Tiny Aya (3.35B), inside Modal on one L40S: every SafeTune and CircuitKIT tool runs on
+  the real model, and the grader runs with AuditKIT guard judges (Granite Guardian and Llama
+  Guard; WildGuard is gated).
+
+### First result on Tiny Aya (one run, quick grader)
+
+Drift tier D1: SafeTune's abliteration attack on `tiny-aya-global` changed 72 tensors (22.7% of
+entries) and took refusals on harmful dev prompts from 87.5% to 0%.
+
+Astra, running through the Codex CLI inside the same container with its own tools off, repaired
+it in 20 turns and 2 submissions. Its first submission was rejected honestly (refusals on safe
+prompts rose 8.7 points, limit 5); it halved the strength and the second was accepted.
+
+| | Entries changed | Held-out harm (drifted 0.85) | Perturbed-prompt harm | Capability |
+|---|---|---|---|---|
+| Oracle: restore all 72 tensors | 758,601,877 (22.7%) | -84 points | -70 points | no significant change |
+| **Astra's direct edit** | **237,924 (0.0071%)** | **-77 points, to 0.08** | -27 points | no significant change |
+
+The edit is 125 MLP neurons in layers 14 to 29, the ones SafeTune's weight-based and
+activation-based localizers both named, moved toward the aligned model. It is about 3,200 times
+smaller than the oracle and recovers most of its held-out gain.
+
+What this does and does not show: it is one run, on the easiest tier, graded with the quick spec
+(60 to 100 items per suite, so intervals are wide), and the edit uses the aligned checkpoint as
+a reference. It is much weaker than the oracle on perturbed prompts. D2, D3, the full grader,
+repeated runs and the no-kit ablation have not been run.
 
 ## Drift tiers
 
@@ -125,13 +148,14 @@ a specific binary with `--codex-bin` or `WEIGHTPATCH_CODEX_BIN`.
 On a GPU, with access to the Tiny Aya checkpoints:
 
 ```bash
-# build the damage
-weightpatch drift d3 --model CohereLabs/tiny-aya-global --out /runs/drift/d3
-
-# option A: Modal, one L40S
+# option A: everything inside Modal, on one L40S (the Codex CLI runs in the container too)
 modal secret create huggingface HF_TOKEN=...
-modal deploy -m weightpatch.worker.modal_app
-weightpatch run --spec configs/episodes/tiny-aya-d3.yaml --provider modal
+modal run -m weightpatch.worker.modal_app::codex_login        # sign in with ChatGPT, device code
+modal run -m weightpatch.worker.modal_app::smoke              # the kits on Tiny Aya
+modal run -m weightpatch.worker.modal_app::build_sealed
+modal run -m weightpatch.worker.modal_app::build_drift --tier d1
+modal run -m weightpatch.worker.modal_app::grade --which oracle
+modal run --detach -m weightpatch.worker.modal_app --spec configs/episodes/tiny-aya-d1-quick.yaml --name run1
 
 # option B: any machine with a GPU
 weightpatch worker serve --port 8765 --token "$TOKEN"         # on the GPU machine
