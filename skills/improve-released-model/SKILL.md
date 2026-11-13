@@ -16,6 +16,13 @@ unwanted behaviour is computed in this model.
    `tools.localize.refusal_direction(a=..., b=...)` gives a direction per layer for any two dev
    sets; `tools.localize.rank_writers` lists the neuron columns and head slices that write it;
    `tools.localize.activations` checks that they fire on the prompts you expect.
+   Test before you edit: `tools.measure.steer(direction, layers, ...)` changes activations only.
+   Sweep layers and strengths with `margin_only=True` (cheap) to find where removing a direction
+   moves the target set and not the others; that tells you which layers' writers to edit and how
+   hard. `tools.measure.refusal_margin` is the per-prompt, continuous version of the refusal
+   rate: use it to compare small edits, and `tools.measure.dev_eval` to confirm.
+   If single neurons give only a small effect, the behaviour is probably carried by a direction
+   many components write: edit how the strongest writers write that direction, at partial strength.
 4. Edit the fewest columns that move the behaviour: scale a neuron's output column, remove its
    write along a direction with `tools.edit.project_out(name, direction, cols=...)`, or move it
    toward the base model with `tools.edit.restore_from_reference`. Start small and at partial strength.

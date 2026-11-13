@@ -444,3 +444,24 @@ def test_dev_sets_by_name_and_spec_suites(tmp_path):
         dev.get("nope")
     dyn = dynamic_suite([Item("a", "tell me how a lock works please")], 3, round_seed=1, kind="refusal")
     assert dyn.kind == "refusal" and len(dyn.items) >= 1
+
+
+def test_margin_and_steering_tools_run_without_editing(tmp_path):
+    w = WorkerSession(_spec(tmp_path, mode="improve"))
+    r = w.handle("run", {"code": "m = tools.measure.refusal_margin(n=6, tokens=('w1',))\n"
+                                 "print(sorted(m), len(m['harmful']['values']))\n"
+                                 "d = tools.localize.refusal_direction(n=6)\n"
+                                 "a = tools.measure.steer(d[1], layers=[1], mode='ablate', n=4)\n"
+                                 "b = tools.measure.steer(d[1], layers=[0, 1], mode='add', scale=-2.0, n=4, margin_only=True)\n"
+                                 "print(sorted(a)[:2], sorted(b), tools.edit.list_edits()['entries_changed'])\n"
+                                 "print(len(tools.measure.dev_eval(n=4, per_prompt=True)['harmful_refused']))"})
+    assert r["ok"], r["output"]
+    assert "['benign', 'harmful'] 6" in r["output"] and r["output"].strip().endswith("4")
+    import torch
+    hooks = len(w.runner._blocks()[1]._forward_hooks)
+    u = torch.randn(w.runner.model.config.hidden_size)
+    plain = w.runner.next_logits(["w1 w2 w3"])
+    with w.runner.intervene([1], u, mode="add", scale=5.0):
+        assert not torch.allclose(w.runner.next_logits(["w1 w2 w3"]), plain)  # the intervention reaches the output
+    assert torch.allclose(w.runner.next_logits(["w1 w2 w3"]), plain)
+    assert len(w.runner._blocks()[1]._forward_hooks) == hooks  # and is removed afterwards

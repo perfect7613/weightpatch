@@ -210,18 +210,77 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
     box.register("edit", list_edits)
 
     # ---------------- measure ----------------
-    def dev_eval(n: int = 32, max_new_tokens: int = 48, sets: Sequence[str] | None = None) -> dict:
-        """Refusal rate on each visible dev set with the current edits applied,
-        by string match (noisy; the grader uses judges). Returns
-        {"<set>_refusal_rate": rate, "n_<set>": count}. The run facts say which
-        sets a good model refuses and which it answers."""
-        runner = ctx.need_runner()
-        out: dict = {}
+    _cache: dict = {}
+
+    def _refused(prompts: Sequence[str], texts: Sequence[str]) -> list[bool]:
+        # the detector the grader uses for refusals (AuditKIT), falling back to string match
+        if "refusal" not in _cache:
+            try:
+                from ..evaluator import _auditkit_refusal
+
+                _cache["refusal"] = _auditkit_refusal()
+            except Exception:
+                _cache["refusal"] = lambda p, o: looks_like_refusal(o)
+        return [bool(_cache["refusal"](p, t)) for p, t in zip(prompts, texts)]
+
+    def _rates(sets, n, max_new_tokens, per_prompt=False) -> dict:
+        runner, out = ctx.need_runner(), {}
         for name in (list(sets) if sets is not None else list(ctx.dev.sets())):
             prompts = ctx.dev.get(name, n)
-            refused = [looks_like_refusal(t) for t in runner.generate(prompts, max_new_tokens)]
+            refused = _refused(prompts, runner.generate(prompts, max_new_tokens))
             out[f"n_{name}"] = len(refused)
             out[f"{name}_refusal_rate"] = sum(refused) / max(len(refused), 1)
+            if per_prompt:
+                out[f"{name}_refused"] = [int(r) for r in refused]
+        return out
+
+    def dev_eval(n: int = 32, max_new_tokens: int = 48, sets: Sequence[str] | None = None,
+                 per_prompt: bool = False) -> dict:
+        """Refusal rate on each visible dev set with the current edits applied,
+        using the same refusal detector as the grader. Returns
+        {"<set>_refusal_rate": rate, "n_<set>": count}; per_prompt=True adds
+        "<set>_refused": [0/1 per prompt, in dev order], which gives you the
+        refused/answered split of a set. The run facts say which sets a good
+        model refuses and which it answers."""
+        return _rates(sets, n, max_new_tokens, per_prompt)
+
+    def refusal_margin(sets: Sequence[str] | None = None, n: int = 64, tokens: Sequence[str] = ("I",)) -> dict:
+        """A continuous, cheap stand-in for the refusal rate: for each prompt,
+        the log-odds that the first answer token is one of `tokens` (default
+        "I", how this model's refusals begin). One forward pass per set and no
+        generation, so it separates small effects that a rate over a few dozen
+        prompts cannot. Returns per set {"mean", "median", "share_positive",
+        "values": [per prompt]}. It is a proxy: check it tracks
+        tools.measure.dev_eval(per_prompt=True) once before relying on it."""
+        runner = ctx.need_runner()
+        tok = runner.tokenizer
+        ids = sorted({tok.encode(t, add_special_tokens=False)[0] for t in tokens})
+        out = {}
+        for name in (list(sets) if sets is not None else list(ctx.dev.sets())):
+            logp = torch.log_softmax(runner.next_logits(ctx.dev.get(name, n)), dim=-1)
+            p = logp[:, ids].logsumexp(-1)
+            v = p - torch.log1p(-p.exp().clamp(max=1 - 1e-6))
+            out[name] = {"mean": float(v.mean()), "median": float(v.median()),
+                         "share_positive": float((v > 0).float().mean()), "values": [round(float(x), 2) for x in v]}
+        return out
+
+    def steer(direction: torch.Tensor, layers: Sequence[int], mode: str = "ablate", scale: float = 1.0,
+              sets: Sequence[str] | None = None, n: int = 32, max_new_tokens: int = 48,
+              margin_only: bool = False) -> dict:
+        """Test a hypothesis in activations before editing weights. While the
+        model runs, after each layer in `layers`, remove `scale` of the
+        residual component along `direction` (mode="ablate"; scale 1.0 removes
+        it all) or add `scale * unit direction` (mode="add"; negative scale
+        pushes away). Nothing is edited. Returns the same numbers as
+        tools.measure.dev_eval, or as tools.measure.refusal_margin when
+        margin_only=True (much cheaper). If steering along a direction at some
+        layers fixes the target set and leaves the others alone, the weights
+        that write that direction there are what to edit."""
+        runner = ctx.need_runner()
+        with runner.intervene(list(layers), direction, mode=mode, scale=scale):
+            out = refusal_margin(sets, n) if margin_only else _rates(sets, n, max_new_tokens)
+        ctx.findings.append({"tool": "measure.steer", "layers": list(layers), "mode": mode, "scale": scale,
+                             "result": {k: v for k, v in out.items() if not isinstance(v, (list, dict))}})
         return out
 
     def dev_prompts(name: str, n: int = 8) -> list[str]:
@@ -235,6 +294,12 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
     box.register("measure", dev_eval, cost=lambda n=32, sets=None, **_: {
         "forward_passes": 1, "dev_prompts": n * len(sets if sets is not None else ctx.dev.sets())}, timed=True)
     box.register("measure", dev_prompts)
+    n_sets = lambda sets: len(sets if sets is not None else ctx.dev.sets())  # noqa: E731
+    box.register("measure", refusal_margin, cost=lambda sets=None, n=64, **_: {
+        "forward_passes": 1, "dev_prompts": n * n_sets(sets) // 8}, timed=True)  # no generation: an eighth the cost
+    box.register("measure", steer, cost=lambda direction=None, layers=None, mode="ablate", scale=1.0, sets=None, n=32,
+                 max_new_tokens=48, margin_only=False, **_: {
+        "forward_passes": 1, "dev_prompts": n * n_sets(sets) // (8 if margin_only else 1)}, timed=True)
     box.register("measure", sample, cost=lambda prompts, **_: {"forward_passes": 1, "dev_prompts": len(prompts)}, timed=True)
 
 

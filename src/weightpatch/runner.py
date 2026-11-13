@@ -13,6 +13,8 @@ nothing here ever materialises them.
 
 from __future__ import annotations
 
+import contextlib
+
 from contextlib import contextmanager
 from typing import Protocol, Sequence
 
@@ -148,6 +150,45 @@ class HFRunner:
             hs = out.hidden_states  # embeddings + one per layer
             chunks.append(torch.stack([hs[layer + 1][:, -1, :] for layer in layers], dim=1).float().cpu())
         return torch.cat(chunks, dim=0)
+
+    @torch.no_grad()
+    def next_logits(self, prompts: Sequence[str]) -> torch.Tensor:
+        """Logits for the first answer token: ``[n_prompts, vocab]`` (float32, CPU)."""
+        self._sync()
+        chunks = []
+        for i in range(0, len(prompts), self.batch_size):
+            enc = self._encode(prompts[i : i + self.batch_size])
+            chunks.append(self.model(**enc).logits[:, -1, :].float().cpu())
+        return torch.cat(chunks, dim=0)
+
+    def _blocks(self):
+        body = getattr(self.model, self.model.base_model_prefix, self.model)
+        return body.layers
+
+    @contextlib.contextmanager
+    def intervene(self, layers: Sequence[int], direction: torch.Tensor, mode: str = "ablate", scale: float = 1.0):
+        """Change the residual stream while the block runs, without touching
+        weights: after each layer in ``layers``, either remove ``scale`` of the
+        component along ``direction`` ("ablate") or add ``scale * direction``
+        ("add"). For testing a hypothesis before it becomes a weight edit."""
+        if mode not in ("ablate", "add"):
+            raise ValueError("mode is 'ablate' or 'add'")
+        p = next(self.model.parameters())
+        u = direction.detach().float().flatten()
+        u = (u / (u.norm() + 1e-12)).to(p.device, p.dtype)
+
+        def hook(_module, _inp, out):
+            h = out[0] if isinstance(out, tuple) else out
+            h = h - scale * (h @ u).unsqueeze(-1) * u if mode == "ablate" else h + scale * u
+            return (h, *out[1:]) if isinstance(out, tuple) else h
+
+        blocks = self._blocks()
+        handles = [blocks[i].register_forward_hook(hook) for i in layers]
+        try:
+            yield
+        finally:
+            for h in handles:
+                h.remove()
 
     @torch.no_grad()
     def generate(self, prompts: Sequence[str], max_new_tokens: int = 64) -> list[str]:
