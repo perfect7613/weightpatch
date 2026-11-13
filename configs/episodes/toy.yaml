@@ -1,0 +1,16 @@
+# CPU toy: a tiny Cohere2 model with planted drift. Runs anywhere, exercises every code path.
+#   weightpatch run --spec configs/episodes/toy.yaml --provider local --effort medium
+model: {source: toy}
+cap: 0.01
+tools: ["inspect.*", "localize.*", "repair.*", "edit.*", "measure.*"]
+budgets: {code_runs: 30, forward_passes: 40, dev_prompts: 400}
+out: runs/toy-worker
+agent:
+  model: codex:gpt-6-astra
+  effort: medium
+  max_turns: 30
+  skills: [read-model-atlas, localize-safety-drift, select-recover-method, direct-edit-repair]
+  task: |
+    This small transformer drifted away from its aligned reference: a few weights were altered.
+    Localize exactly which weights drifted, using more than one tool, and repair them with the
+    smallest edit you can. Finish by stating the tensor, the columns and the evidence.

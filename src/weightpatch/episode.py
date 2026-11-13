@@ -115,8 +115,12 @@ class Episode:
 
     def handoff_message(self) -> str:
         notebook = "\n".join(f"- {n}" for n in self.kernel.notebook) or "- (empty)"
-        edits = json.dumps(self.kernel.namespace["tools"].edit.list_edits(), default=str) \
-            if hasattr(self.kernel.namespace.get("tools"), "edit") else "(no edit tools)"
+        if hasattr(self.kernel, "edits"):  # a kernel on a remote worker
+            edits = json.dumps(self.kernel.edits(), default=str)
+        elif hasattr(self.kernel.namespace.get("tools"), "edit"):
+            edits = json.dumps(self.kernel.namespace["tools"].edit.list_edits(), default=str)
+        else:
+            edits = "(no edit tools)"
         return "\n".join([
             self.first_message(), "",
             "# This is a continuation",

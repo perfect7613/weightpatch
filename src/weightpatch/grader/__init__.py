@@ -148,7 +148,7 @@ class Grader:
         self._cache: dict[tuple[str, str, int], SuiteRun] = {}
 
     def _run(self, which: str, suite: str, n: int) -> SuiteRun:
-        if which == "candidate":
+        if which == "candidate" or suite == "dynamic":  # the dynamic suite is new every round
             return self.evaluator.run(which, suite, n)
         key = (which, suite, n)  # reference runs are computed once
         if key not in self._cache:
@@ -157,6 +157,9 @@ class Grader:
 
     def grade(self, candidate: Candidate) -> Verdict:
         numbers: dict[str, Any] = {}
+        new_round = getattr(self.evaluator, "new_round", None)
+        if new_round is not None:
+            new_round()  # fresh dynamic variants for this submission
 
         # 1. integrity -----------------------------------------------------
         changed = diff_entries(self.drifted, candidate.state)

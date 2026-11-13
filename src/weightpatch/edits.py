@@ -58,6 +58,13 @@ class EditPolicy:
         if not any(fnmatch.fnmatch(name, p) for p in self.allowed):
             raise EditRefused(f"{name} is outside the tensors this episode may edit")
 
+    def is_editable(self, name: str) -> bool:
+        try:
+            self.check_name(name)
+        except EditRefused:
+            return False
+        return True
+
 
 def changed_entries(base: torch.Tensor, new: torch.Tensor, dtype: torch.dtype = DEPLOY_DTYPE) -> int:
     """Entries that differ once both tensors are cast to the deployment dtype.
@@ -87,6 +94,7 @@ class Edit:
     name: str
     entries_changed: int
     evidence: str
+    method: str | None = None  # None = a direct edit; else the repair method that produced it
 
 
 @dataclass
@@ -149,18 +157,70 @@ class EditSession:
             )
         cap = self.policy.max_fraction_entries
         if cap is not None:
-            others = sum(e.entries_changed for e in self._latest().values() if e.name != name)
-            if (others + n_changed) / self.total_entries > cap:
+            # the cap governs direct edits; a tensor a repair method already
+            # rewrote is charged only for what this edit changes on top of it
+            others = sum(e.entries_changed for e in self._latest().values()
+                         if e.name != name and e.method is None)
+            if name in self._current and self._latest()[name].method is not None:
+                n_changed_direct = changed_entries(self._current[name], new)
+            else:
+                n_changed_direct = n_changed
+            n_cap = n_changed_direct
+            if (others + n_cap) / self.total_entries > cap:
                 raise EditRefused(
-                    f"{name}: edit would change {(others + n_changed) / self.total_entries:.4%} of "
+                    f"{name}: edit would change {(others + n_cap) / self.total_entries:.4%} of "
                     f"the model; the direct-edit cap is {cap:.4%}. Target neurons or head slices, "
                     "not whole matrices."
                 )
+        prior = self._latest().get(name)
         self._current[name] = new
-        edit = Edit(self._next_id, name, n_changed, evidence.strip())
+        # a direct edit on top of a method's tensor keeps the method's mark:
+        # the candidate as a whole is still not a direct-edit-only repair
+        edit = Edit(self._next_id, name, n_changed, evidence.strip(),
+                    method=prior.method if prior is not None else None)
         self._next_id += 1
         self._edits.append(edit)
         return edit
+
+    def adopt(self, method: str, new_state: Mapping[str, torch.Tensor], evidence: str) -> dict:
+        """Stage the result of a whole-model repair method (ReSta, CTheta, ...).
+
+        Repair methods rewrite many tensors at once, so the direct-edit cap
+        does not apply to them; the candidate is then graded in the
+        uncapped arm (:attr:`direct_edit` becomes False). Protected tensors
+        are left as they are and reported, and the evidence rule still holds.
+        """
+        if not evidence.strip():
+            raise EditRefused(f"{method}: every repair must cite its evidence")
+        changed, skipped, entries = [], [], 0
+        for name, tensor in new_state.items():
+            if name not in self.baseline:
+                continue
+            base32 = self.baseline[name].detach().to(torch.float32)
+            new = tensor.detach().to(torch.float32).cpu()
+            if tuple(new.shape) != tuple(base32.shape):
+                raise EditRefused(f"{method}: {name} changed shape")
+            current = self._current.get(name, base32)
+            if changed_entries(current, new) == 0:
+                continue
+            if not self.policy.is_editable(name):
+                skipped.append(name)
+                continue
+            if not torch.isfinite(new).all():
+                raise EditRefused(f"{method}: {name} contains NaN or Inf; nothing was applied")
+            changed.append((name, new, changed_entries(base32, new)))
+        for name, new, n in changed:
+            self._current[name] = new
+            self._edits.append(Edit(self._next_id, name, n, evidence.strip(), method=method))
+            self._next_id += 1
+            entries += n
+        return {"method": method, "tensors_changed": len(changed), "entries_changed": entries,
+                "fraction_of_model": entries / self.total_entries, "skipped_protected": skipped}
+
+    @property
+    def direct_edit(self) -> bool:
+        """True while every live edit is a direct edit (the capped arm)."""
+        return all(e.method is None for e in self._latest().values())
 
     def revert(self, name: str | None = None) -> list[str]:
         """Undo the edit to one tensor, or all edits when ``name`` is None."""
@@ -220,6 +280,7 @@ class EditSession:
             "baseline_hash": state_hash(self.baseline),
             "entries_changed": self.entries_changed(),
             "fraction_changed": self.fraction_changed(),
+            "direct_edit": self.direct_edit,
             "edits": [e.__dict__ for e in self.list_edits()],
         }
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -227,7 +288,10 @@ class EditSession:
 
 
 def _edit_row(edit: Edit) -> dict:
-    return {"edit_id": edit.edit_id, "name": edit.name, "entries_changed": edit.entries_changed}
+    row = {"edit_id": edit.edit_id, "name": edit.name, "entries_changed": edit.entries_changed}
+    if edit.method:
+        row["method"] = edit.method
+    return row
 
 
 def _is_scalar_multiple(base: torch.Tensor, new: torch.Tensor) -> bool:

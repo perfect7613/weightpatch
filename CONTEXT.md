@@ -31,4 +31,12 @@ Use these words exactly, in code, docs and prompts.
 | **Quarantine log** | Where integrity-failure details go. Humans read it; agents never do. |
 | **Dev set** | Prompts the agent may see. **Held-out pool** and **dynamic set** are sealed inside the grader. |
 | **Drift tier** | D1 abliteration, D2 GRAFT-planted (neuron-level answer key), D3 contaminated fine-tune. |
+| **Method edit** | An edit staged by a repair method through `EditSession.adopt`. Uncapped, revertible, and it moves the candidate out of the direct-edit arm. |
+| **Circuit handle** | The name (`circuit:3`) a localizer returns for a circuit held on the worker. Repair tools take handles, so SafeTune and CircuitKIT results feed each other. |
+| **Worker** | The half of the harness that sits next to the weights: checkpoints, kernel, tool box, grader. Reached through the worker protocol. |
+| **Provider** | A way to reach a worker: local, Modal, or HTTP to any GPU machine. |
+| **Suite** | A fixed, ordered list of items of one kind (harm, refusal, capability). Every model sees the same items, so comparisons are paired. |
+| **Judge** | An AuditKIT guard model that labels an answer harmful or not. Two judges per harm suite. |
+| **RETAIN / FORGET** | GRAFT's two adapters. Flagged examples train FORGET; FORGET is dropped at deployment, or left on to plant D2 drift. |
+| **Oracle repair** | The repair the answer key implies. It bounds what any repair can reach on that tier. |
 | **Answer key** | The known cause of a planted drift, used to score localization and repair exactly. |

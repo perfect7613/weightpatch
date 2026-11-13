@@ -15,6 +15,9 @@ dependencies = [
 [project.optional-dependencies]
 hf = ["transformers>=5.15,<6", "tokenizers>=0.20"]
 dev = ["pytest>=8", "transformers>=5.15,<6", "tokenizers>=0.20"]
+# Lexsi's stack: the tools, the evaluator and the drift tiers are built on these
+lexsi = ["safetune>=0.1.12,<0.2", "circuitkit==0.2.3", "auditkit==1.1.11", "datasets", "peft", "accelerate"]
+modal = ["modal>=1.0"]
 
 [project.scripts]
 weightpatch = "weightpatch.cli:main"

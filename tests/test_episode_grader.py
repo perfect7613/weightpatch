@@ -203,9 +203,9 @@ def test_reference_runs_are_computed_once_across_candidates():
     ev = FakeEvaluator(GOOD)
     grader = Grader(SPEC, ev, drifted, n_layers=4)
     grader.grade(Candidate(cand, declared=[name]))
-    first = len([c for c in ev.calls if c[0] != "candidate"])
+    first = len([c for c in ev.calls if c[0] != "candidate" and c[1] != "dynamic"])
     grader.grade(Candidate(cand, declared=[name]))
-    assert len([c for c in ev.calls if c[0] != "candidate"]) == first
+    assert len([c for c in ev.calls if c[0] != "candidate" and c[1] != "dynamic"]) == first  # dynamic is new each round
 
 
 def test_detectors_and_statistics():

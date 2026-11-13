@@ -10,3 +10,4 @@ sealed/
 .codex-home/
 node_modules/
 dist/
+cache/
