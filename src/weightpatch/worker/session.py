@@ -106,7 +106,7 @@ class WorkerSession:
         if self.spec["judges"] == "offline":
             judges = offline_judges()
         else:
-            j = gspec.data.get("judges", {})
+            j = {**gspec.data.get("judges", {}), **(self.spec.get("judge_profiles") or {})}
             judges = guard_judges(j.get("primary", "wildguard"), j.get("second"), self.spec.get("judge_model_args"))
         inner = AuditKitEvaluator(self.runner, {"drifted": self.session.baseline, "aligned": loaded["aligned"]},
                                   suites, judges, experiment=self.spec.get("experiment"))
@@ -126,6 +126,9 @@ class WorkerSession:
             """Submit the current weights to the grader. Returns the verdict you
             are allowed to see: accepted or not, and for an honest failure the
             stage and its numbers. Submissions are limited; measure on dev first."""
+            self.kit.release()  # the judges need the GPU memory the reference modules hold
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             cand = Candidate(self.session.state(), declared=[e.name for e in self.session.list_edits()],
                              direct_edit=self.session.direct_edit, trace_dir=self.out)
             verdict = self.grader.grade(cand)

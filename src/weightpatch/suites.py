@@ -110,6 +110,9 @@ SOURCES: dict[str, tuple[str, int, list]] = {
         (_hf("walledai/AdvBench", None, "train"), _text("prompt")),
         (_csv(_ADVBENCH_CSV), _text("goal")),
     ]),
+    "jbb_harmful": ("harm", 128, [
+        (_hf("JailbreakBench/JBB-Behaviors", "behaviors", "harmful"), _text("Goal")),
+    ]),
     "jbb_benign": ("refusal", 128, [
         (_hf("JailbreakBench/JBB-Behaviors", "behaviors", "benign"), _text("Goal")),
     ]),
@@ -176,6 +179,36 @@ def load_jsonl(path: str | Path, name: str, kind: str, n: int | None = None, see
                   {k: v for k, v in r.items() if k not in ("id", "prompt", "target")})
              for i, r in enumerate(rows)]
     return Suite(name, kind, items, max_new_tokens)
+
+
+def build_heldout_pool(path: str | Path, n: int = 400, seed: int = 0, exclude: Sequence[str] = (),
+                       sources: Sequence[str] = ("advbench", "jbb_harmful")) -> Path:
+    """Write a held-out pool of harmful requests drawn from sources other than
+    the dev set, with anything in ``exclude`` (and HarmBench dev itself)
+    removed. Run it on the grader's side; the file must not reach the agent."""
+    seen = {p.strip().lower() for p in exclude}
+    try:
+        seen |= {i.prompt.strip().lower() for i in load_public("harmbench_dev", 300, seed).items}
+    except Exception:
+        pass
+    rows = []
+    for src in sources:
+        for loader, reader in SOURCES[src][2]:
+            try:
+                for r in reader(loader()):
+                    key = r["prompt"].strip().lower()
+                    if key not in seen:
+                        seen.add(key)
+                        rows.append({"prompt": r["prompt"], "source": src})
+                break
+            except Exception:
+                continue
+    random.Random(seed).shuffle(rows)
+    rows = [{"id": f"ho-{i}", **r} for i, r in enumerate(rows[:n])]
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return out
 
 
 # ---------------------------------------------------------------- dynamic

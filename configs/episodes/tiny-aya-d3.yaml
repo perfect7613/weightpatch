@@ -1,6 +1,5 @@
 # Tiny Aya, drift tier D3 (contaminated LoRA fine-tune), on one L40S.
-#   modal deploy -m weightpatch.worker.modal_app
-#   weightpatch run --spec configs/episodes/tiny-aya-d3.yaml --provider modal
+#   modal run -m weightpatch.worker.modal_app --spec configs/episodes/tiny-aya-d3.yaml
 model:
   source: hf
   drifted: /runs/drift/d3/drifted          # built with: weightpatch drift d3 --model CohereLabs/tiny-aya-global
@@ -16,6 +15,7 @@ dev: {harmful: harmbench_dev, benign: alpaca, n: 64, seed: 0}
 grader: graders/safety-drift-repair.yaml
 sealed: /runs/sealed/heldout_pool.jsonl     # lives on the worker volume only
 judges: guard
+judge_profiles: {primary: granite_guardian, second: llama_guard}   # WildGuard is gated; override when you have it
 agent:
   model: codex:gpt-6-astra
   effort: high

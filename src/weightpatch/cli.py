@@ -23,7 +23,11 @@ from .tools import ToolBox
 from .tools.native import ToolContext, register_native_tools
 from .toy import TOY_TASK, make_planted_drift, score_repair
 
-SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
+import os
+
+# the repo root holds skills/, graders/ and configs/; on a worker image it is WEIGHTPATCH_ROOT
+ROOT = Path(os.environ.get("WEIGHTPATCH_ROOT") or Path(__file__).resolve().parents[2])
+SKILLS_DIR = ROOT / "skills"
 
 
 def load_skills(names: list[str], skills_dir: Path = SKILLS_DIR) -> list[str]:

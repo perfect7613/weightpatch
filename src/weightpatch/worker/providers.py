@@ -64,11 +64,11 @@ class _ModalHandle:
 
 
 class ModalProvider:
-    """A deployed ``weightpatch-worker`` Modal app (one L40S per container)."""
+    """A deployed ``weightpatch`` Modal app (one L40S per container)."""
 
     name = "modal"
 
-    def __init__(self, app: str = "weightpatch-worker", cls: str = "Worker", environment: str | None = None):
+    def __init__(self, app: str = "weightpatch", cls: str = "Worker", environment: str | None = None):
         self.app, self.cls, self.environment = app, cls, environment
 
     def open(self, spec: Mapping[str, Any]) -> WorkerHandle:
