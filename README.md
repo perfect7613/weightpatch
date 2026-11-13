@@ -53,7 +53,7 @@ against. Every call into them was checked against their source and exercised in 
 | `tools` | The tool box (allow-list, budget charging, call log, self-description) and the PyTorch-only tools. |
 | `tools/kits` | The SafeTune and CircuitKIT tools above, in the same tool box. |
 | `runner` | The one seam through which the model runs. Lends the live model to a repair method and serves the drifted and aligned references from one copy. |
-| `atlas` | Per-checkpoint context built by code: card, name map (HF names, TransformerLens hooks, CircuitKIT node ids), quirks, findings. |
+| `atlas` | Per-checkpoint context built by code: card, a wiring description and diagram of one layer, name map (HF names, TransformerLens hooks, CircuitKIT node ids), quirks, the measured baseline profile, findings. |
 | `episode` | The loop: explain before code, one Python block per turn, handoffs, full trace on disk. |
 | `grader` | Frozen, hashed spec; six stages cheapest first; hack detectors; quarantined feedback. |
 | `evaluator`, `suites` | The AuditKIT-backed evaluator and the benchmark suites, including a dynamic suite rebuilt for every submission. |
@@ -67,7 +67,7 @@ LLM cheat reviewer, the goal router for prompts beyond safety drift, and the exp
 
 ### What has and has not been run
 
-- All 64 tests pass on CPU. They run the real kits on a tiny random Cohere2 model: all six
+- All 67 tests pass on CPU. They run the real kits on a tiny random Cohere2 model: all six
   SafeTune recover methods, the SafeTune localizers, CircuitKIT discovery and faithfulness,
   AuditKIT evaluation and significance, GRAFT training and merging, the three drift tiers, and
   the worker over the local and HTTP providers.
@@ -77,7 +77,41 @@ LLM cheat reviewer, the goal router for prompts beyond safety drift, and the exp
   the real model, and the grader runs with AuditKIT guard judges (Granite Guardian and Llama
   Guard; WildGuard is gated).
 
-### First result on Tiny Aya (one run, quick grader)
+### Improving Tiny Aya as released: fewer refusals of safe requests
+
+This is the main use: no damage is planted. The model is `CohereLabs/tiny-aya-global` exactly as
+released, and the goal is one measured weakness. Profiled with the grader's suites and judges,
+it gives a harmful answer on 14% of HarmBench prompts and refuses about 30% of OR-Bench hard
+prompts, which are safe to answer. Astra was asked to cut those refusals without the model
+starting to answer harmful requests.
+
+Astra ran through the Codex CLI in the same container with its own tools off. It used
+SafeTune's activation and weight rankings on two contrasts (borderline vs benign, harmful vs
+benign) to pick MLP neurons named for the first and not the second, tested directions with
+activation steering before touching a weight, and then amplified a borderline-specific
+direction, orthogonal to the harmful-refusal direction, in 195 MLP output columns of layers 20,
+22, 23 and 24. The grader accepted the first submission.
+
+| Measured by the grader on prompts the agent never saw | Released | Edited |
+|---|---|---|
+| Refusals of safe requests, OR-Bench hard, 200 sealed prompts | 31.5% | **10.0%** (-21.5 points, 95% interval -27.5 to -15.5) |
+| Same, second sealed slice of 120 | 30.0% | 9.2% |
+| Same, perturbed variants made for this submission (40) | | -10 points (interval -20 to -2.5) |
+| Harmful answers, HarmBench (80), two guard judges | | -2.5 points, not significant |
+| Harmful answers, sealed AdvBench and JailbreakBench (100) | | no change |
+| MMLU, MILU Hindi, MedMCQA (80 each) | | +1.3, 0, -1.3 points, none significant |
+| Weights changed | | 398,328 entries in 4 tensors, 0.012% of the model |
+
+The run took 23 turns, 22 code blocks and one submission, about 58 minutes of GPU time, and
+5.9M input tokens (5.4M of them cached) with 109k output tokens.
+
+What this does and does not show: one run, one model, one goal. The intervals are from a paired
+bootstrap over 200 prompts, so the size of the gain is known to about 6 points either way. The
+harm checks would catch a rise of more than 5 points, not a smaller one. An earlier run with a
+smaller measurement budget and no steering tool was rejected by the grader (-2.5 points, not
+significant), so the result depends on the tools the agent has.
+
+### Drift repair on Tiny Aya (validation with a known answer; one run, quick grader)
 
 Drift tier D1: SafeTune's abliteration attack on `tiny-aya-global` changed 72 tensors (22.7% of
 entries) and took refusals on harmful dev prompts from 87.5% to 0%.
@@ -155,7 +189,9 @@ modal run -m weightpatch.worker.modal_app::smoke              # the kits on Tiny
 modal run -m weightpatch.worker.modal_app::build_sealed
 modal run -m weightpatch.worker.modal_app::build_drift --tier d1
 modal run -m weightpatch.worker.modal_app::grade --which oracle
-modal run --detach -m weightpatch.worker.modal_app --spec configs/episodes/tiny-aya-d1-quick.yaml --name run1
+modal run -m weightpatch.worker.modal_app::profile             # where the released model has room to improve
+modal run --detach -m weightpatch.worker.modal_app::main --spec configs/episodes/tiny-aya-overrefusal.yaml --name run1
+modal run --detach -m weightpatch.worker.modal_app::main --spec configs/episodes/tiny-aya-d1-quick.yaml --name d1
 
 # option B: any machine with a GPU
 weightpatch worker serve --port 8765 --token "$TOKEN"         # on the GPU machine
