@@ -15,6 +15,7 @@ dev: {harmful: harmbench_dev, benign: alpaca, n: 64, seed: 0}
 grader: graders/safety-drift-repair.yaml
 sealed: /runs/sealed/heldout_pool.jsonl     # lives on the worker volume only
 judges: guard
+judge_model_args: {dtype: bfloat16, device_map: cuda}
 judge_profiles: {primary: granite_guardian, second: llama_guard}   # WildGuard is gated; override when you have it
 agent:
   model: codex:gpt-6-astra

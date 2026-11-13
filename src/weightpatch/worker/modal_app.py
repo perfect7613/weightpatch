@@ -95,7 +95,10 @@ def codex_check(model: str = "gpt-6-astra") -> dict:
     client = CodexExecClient(model=model, effort="low", auth_file=f"{LOGIN_HOME}/auth.json")
     reply = client.send("Reply with the single word: ready", new_conversation=True)
     _keep_login(client)
-    return {"logged_in": True, "reply": reply.text.strip()[:80], "tool_free": reply.tool_free}
+    out = {"logged_in": True, "model": model, "reply": reply.text.strip()[:80], "tool_free": reply.tool_free,
+           "usage": reply.usage}
+    print("CODEX_CHECK", json.dumps(out), flush=True)
+    return out
 
 
 def _keep_login(client) -> None:
@@ -109,7 +112,8 @@ def _keep_login(client) -> None:
 
 # ------------------------------------------------------------------- tests
 @app.function(**GPU_KW)
-def smoke(aligned: str = "CohereLabs/tiny-aya-global", base: str = "CohereLabs/tiny-aya-base", n: int = 16) -> dict:
+def smoke(aligned: str = "CohereLabs/tiny-aya-global", base: str = "CohereLabs/tiny-aya-base", n: int = 16,
+          drifted: str = "") -> dict:
     """The kits on the real model: load Tiny Aya, call each family of tool
     once, report what came back and how long it took. Uses the aligned model
     as its own 'drifted' checkpoint, so this checks plumbing, not repair."""
@@ -120,7 +124,8 @@ def smoke(aligned: str = "CohereLabs/tiny-aya-global", base: str = "CohereLabs/t
     from weightpatch.worker.session import WorkerSession
 
     t0, out = time.time(), {"gpu": torch.cuda.get_device_name(0)}
-    w = WorkerSession({"model": {"source": "hf", "drifted": aligned, "aligned": aligned, "base": base},
+    w = WorkerSession({"model": {"source": "hf", "drifted": drifted or aligned, "aligned": aligned, "base": base,
+                                 "tokenizer": aligned},
                        "out": "/runs/smoke", "budgets": {}, "cap": 0.001,
                        "dev": {"harmful": "harmbench_dev", "benign": "alpaca", "n": max(n, 32), "seed": 0}})
     out["load_seconds"] = round(time.time() - t0, 1)
@@ -163,6 +168,8 @@ def smoke(aligned: str = "CohereLabs/tiny-aya-global", base: str = "CohereLabs/t
                        ("safety_vector_restore", lambda: t.repair.safety_vector_restore(evidence="smoke"))):
         step("repair." + name, lambda call=call: {k: v for k, v in call().items() if k != "skipped_protected"})
         w.session.revert()
+    step("dev_eval_aligned_restore", lambda: (t.edit.restore_from_reference(
+        "model.layers.14.mlp.down_proj.weight", cols=list(range(64)), evidence="smoke"), t.measure.dev_eval(n=n))[1])
     out["peak_gpu_gb"] = round(torch.cuda.max_memory_allocated() / 2 ** 30, 1)
     out["total_seconds"] = round(time.time() - t0, 1)
     Path("/runs/smoke/report.json").write_text(json.dumps(out, indent=2, default=str))
@@ -194,6 +201,34 @@ def build_sealed(n: int = 400, seed: int = 0) -> dict:
     path = build_heldout_pool("/runs/sealed/heldout_pool.jsonl", n=n, seed=seed)
     runs.commit()
     return {"path": str(path), "items": sum(1 for _ in open(path))}
+
+
+@app.function(**GPU_KW)
+def grade_reference(spec_yaml: str, which: str = "oracle") -> dict:
+    """Grade a known candidate, to check the grader itself on the real model.
+    which="oracle": every drifted tensor restored from the aligned model (the
+    best any repair can do). which="resta": SafeTune ReSta at its documented
+    setting, with no agent."""
+    import yaml
+
+    from weightpatch.worker.session import WorkerSession
+
+    spec = yaml.safe_load(spec_yaml)
+    spec.pop("agent", None)
+    spec["out"] = f"/runs/grade-{which}"
+    w = WorkerSession(spec)
+    t = w.box.namespace()
+    if which == "oracle":
+        w.session.adopt("oracle", {n: v for n, v in w.ctx.reference.items()}, evidence="aligned checkpoint")
+    elif which == "resta":
+        t.repair.resta(evidence="baseline: no localization", alpha=0.25)
+    else:
+        raise ValueError(which)
+    before = w.session.fraction_changed()
+    feedback = t.measure.submit(note=which)
+    runs.commit()
+    return json.loads(json.dumps({"which": which, "fraction_changed": before, "feedback": feedback,
+                                  "verdict": w.verdicts[-1], "judges": getattr(w, "judges_label", "")}, default=str))
 
 
 # ----------------------------------------------------------------- episode
@@ -259,6 +294,12 @@ class Worker:
         if method in ("export", "snapshot", "close"):
             runs.commit()
         return out
+
+
+@app.local_entrypoint()
+def grade(spec: str = "configs/episodes/tiny-aya-d1-quick.yaml", which: str = "oracle"):
+    """modal run -m weightpatch.worker.modal_app::grade --which oracle"""
+    print(json.dumps(grade_reference.remote(Path(spec).read_text(), which=which), indent=2, default=str))
 
 
 @app.local_entrypoint()

@@ -100,6 +100,16 @@ class KitContext:
             self._modules[which] = m.eval()
         return self._modules[which]
 
+    def free_hooked(self) -> None:
+        """Drop the TransformerLens copies CircuitKIT ran on."""
+        if self._tl:
+            self._tl.clear()
+            import gc
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     def release(self) -> None:
         """Drop the reference modules and TransformerLens copies."""
         self._modules.clear()
@@ -122,6 +132,31 @@ def units_of(info: Any) -> dict[int, list[int]]:
         if m:
             out.setdefault(int(m.group(1)), []).append(int(m.group(3)))
     return {k: sorted(v) for k, v in sorted(out.items())}
+
+
+_ACT_MODULES = ("mlp.act_fn", "mlp.act")
+
+
+def _as_down_proj(info: Any) -> None:
+    """SafeTune's activation method may read neurons at the MLP's activation
+    (``mlp.act_fn``). Neuron i there is column i of ``mlp.down_proj``, which is
+    the weight a repair can act on, so name the units by that module."""
+    def fix(x):
+        if isinstance(x, str):
+            for a in _ACT_MODULES:
+                x = x.replace(a, "mlp.down_proj") if (x == a or f".{a}." in x) else x
+            return x
+        if isinstance(x, Mapping):
+            return {fix(k): v for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return type(x)(fix(v) for v in x)
+        return x
+
+    su, ls = info.safety_units, info.layer_suggestions
+    for obj, attrs in ((su, ("module_names", "unit_ids", "activation_correlation")), (ls, ("target_modules",))):
+        for attr in attrs:
+            if getattr(obj, attr, None) is not None:
+                setattr(obj, attr, fix(getattr(obj, attr)))
 
 
 def _summary(info: Any) -> dict:
@@ -192,6 +227,7 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
             info = safety_circuit_info(
                 model, kit.runner.tokenizer, harmful, benign, top_k_per_layer=top_k, target_module=module,
                 target_layers=list(layers) if layers is not None else None, method=method)
+        _as_down_proj(info)
         handle = kit.keep(info, f"safetune.safety_neurons[{method},{on}]")
         out = {"circuit": handle, "units": units_of(info), **_summary(info)}
         ctx.findings.append({"tool": "localize.safety_neurons", "method": method, "on": on,
@@ -214,7 +250,9 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
             info = eap_safety_circuit(model, harmful, benign, cfg, tokenizer=kit.runner.tokenizer)
         handle = kit.keep(info, f"safetune.eap[{method},{on}]")
         su = info.safety_units
-        scores = dict(zip(list(su.unit_ids or []), [float(x) for x in (su.activation_correlation or [])]))
+        raw = su.activation_correlation or {}
+        scores = ({str(k): float(v) for k, v in raw.items()} if isinstance(raw, Mapping)
+                  else dict(zip(list(su.unit_ids or []), [float(x) for x in raw])))
         top = dict(sorted(scores.items(), key=lambda kv: -abs(kv[1]))[:24])
         ctx.findings.append({"tool": "localize.eap_circuit", "method": method, "on": on, "circuit": handle, "top": top})
         return {"circuit": handle, "scores": top, **_summary(info)}
@@ -267,6 +305,7 @@ def _register_safetune(box: ToolBox, kit: KitContext) -> None:
         if not evidence.strip():
             raise ValueError("cite your evidence: which localization result says this method fits")
         runner = kit.runner
+        kit.free_hooked()  # a TransformerLens copy and a repair do not fit on the GPU together
         with runner.borrow() as model:
             trainer = build(model)
             out = trainer.apply()
