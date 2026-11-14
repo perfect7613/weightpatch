@@ -543,6 +543,115 @@ def publish(name: str, model_repo: str, dataset_repo: str, title: str, released:
     return out_info
 
 
+RUN_CARD = """\
+---
+license: mit
+tags: [weightpatch, agent-traces, weight-editing, lexsi]
+---
+# {title}
+
+{summary}
+
+One run of the WeightPatch harness (https://github.com/{github}): an agent (GPT-6 Astra, its own
+tools off) editing the weights of `{released}` with Lexsi Labs' SafeTune, CircuitKIT and AuditKIT
+as tools, judged by a grader on prompts it never saw. This repo holds that one run and nothing else.
+
+## Files
+- `REPORT.md`: the run report, written by the report agent from `report_evidence.md`.
+- `report.json`: outcome, grader verdicts, budget and token use.
+- `edits_by_layer.json`: every changed tensor and column, with sizes (when the run kept an edit).
+- `trace/turns/tNNN/`: per turn, the message sent to the agent (`prompt.txt`), its reply with its
+  explanation (`answer.md`), the code it ran (`code.py`), what the code printed (`output.txt`), the raw
+  model events (`events.jsonl`) and token use (`run.json`).
+- `trace/notebook.md`, `trace/tool_calls.jsonl`: the agent's notes and every tool call with its cost.
+- `worker/verdicts.jsonl`: each grader verdict in full. `worker/patch/`: the changed tensors and manifest.
+- `worker/atlas/`: the model atlas the agent started from (architecture, wiring, diagram, profile, findings).
+- `episode.yaml`, `grader.yaml`: the specs this run used, when present; otherwise see the first message in `trace/turns/t001/prompt.txt` and the GitHub history.
+
+The trace quotes prompts from public benchmarks and short model answers to them. The grader's
+sealed prompts are not included.
+{links}
+"""
+
+
+def _collect(api, owner: str, title: str, repo: str, kind: str, private: bool) -> str:
+    col = api.create_collection(title=title, namespace=owner, private=private, exists_ok=True,
+                                description="WeightPatch, Lexsi Labs AI Safety and Alignment Hackathon")
+    api.add_collection_item(col.slug, item_id=repo, item_type=kind, exists_ok=True)
+    return f"https://huggingface.co/collections/{col.slug}"
+
+
+def _check_clean(stage: Path) -> None:
+    hits = [str(p.relative_to(stage)) for p in stage.rglob("*") if p.is_file() and p.suffix != ".safetensors"
+            and re.search(r"hf_[A-Za-z0-9]{20}|refresh_token|access_token|@gmail\.com", p.read_text(errors="ignore"))]
+    if hits:
+        raise RuntimeError(f"refusing to publish: possible credentials or personal details in {hits[:5]}")
+
+
+@app.function(**CPU_KW)
+def publish_run(name: str, repo: str, title: str, summary: str, spec: str = "", grader: str = "",
+                links: str = "", released: str = "CohereLabs/tiny-aya-global", github: str = "perfect7613/weightpatch",
+                collection: str = "WeightPatch: datasets and traces", private: bool = False) -> dict:
+    """One run, one dataset repo: its trace, verdicts, atlas, patch and report."""
+    from huggingface_hub import HfApi
+
+    api, stage = HfApi(token=os.environ["HF_TOKEN"]), Path("/tmp/publish-run")
+    shutil.rmtree(stage, ignore_errors=True)
+    shutil.copytree(f"/runs/{name}", stage, ignore=shutil.ignore_patterns("circuitkit", "ckpt-*", "cache", "*.pt"))
+    for ev in stage.rglob("events.jsonl"):  # session ids of the model provider are not part of the record
+        ev.write_text(re.sub(r'"thread_id": "[^"]*"', '"thread_id": "redacted"', ev.read_text()))
+    for src, dst in ((spec, "episode.yaml"), (grader, "grader.yaml")):
+        if src and Path("/app", src).exists():
+            shutil.copy2(Path("/app", src), stage / dst)
+    _check_clean(stage)
+    (stage / "README.md").write_text(RUN_CARD.format(title=title, summary=summary, github=github, released=released,
+                                                     links=("\n" + links) if links else ""))
+    api.create_repo(repo, repo_type="dataset", private=private, exist_ok=True)
+    api.upload_folder(folder_path=str(stage), repo_id=repo, repo_type="dataset", commit_message=f"WeightPatch run {name}")
+    out = {"dataset": f"https://huggingface.co/datasets/{repo}",
+           "collection": _collect(api, repo.split("/")[0], collection, repo, "dataset", private)}
+    print("PUBLISHED", json.dumps(out), flush=True)
+    return out
+
+
+@app.function(**CPU_KW)
+def publish_files(repo: str, kind: str, title: str, body: str, files: str, collection: str,
+                  license: str = "mit", base_model: str = "", private: bool = False) -> dict:
+    """A small repo of its own: named files from the runs volume (``src=dst`` pairs,
+    comma separated) with a card. Used for a patch-only model repo and for the
+    baseline measurements."""
+    from huggingface_hub import HfApi
+
+    api, stage = HfApi(token=os.environ["HF_TOKEN"]), Path("/tmp/publish-files")
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
+    for pair in files.split(","):
+        src, dst = pair.split("=")
+        (stage / dst).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path("/runs", src), stage / dst)
+    _check_clean(stage)
+    head = f"---\nlicense: {license}\n" + (f"base_model: {base_model}\n" if base_model else "") + \
+           "tags: [weightpatch, weight-editing, lexsi]\n---\n"
+    (stage / "README.md").write_text(f"{head}# {title}\n\n{body}\n")
+    api.create_repo(repo, repo_type=kind, private=private, exist_ok=True)
+    api.upload_folder(folder_path=str(stage), repo_id=repo, repo_type=kind, commit_message=title)
+    out = {"repo": repo, "collection": _collect(api, repo.split("/")[0], collection, repo, kind, private)}
+    print("PUBLISHED", json.dumps(out), flush=True)
+    return out
+
+
+@app.function(secrets=[hf], timeout=600)
+def uncollect(collection_slug: str, repo: str) -> list:
+    """Take a repo out of a collection (the repo itself is left alone)."""
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=os.environ["HF_TOKEN"])
+    for item in api.get_collection(collection_slug).items:
+        if item.item_id == repo:
+            api.delete_collection_item(collection_slug, item.item_object_id)
+    return [i.item_id for i in api.get_collection(collection_slug).items]
+
+
 # ------------------------------------------------------- remote worker (kept)
 @app.cls(scaledown_window=20 * 60, max_containers=1, **GPU_KW)
 class Worker:

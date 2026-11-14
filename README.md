@@ -114,7 +114,7 @@ significant), so the result depends on the tools the agent has.
 
 The edited model, with the patch and the run report: https://huggingface.co/Perfect7613/tiny-aya-global-weightpatch-overrefusal.
 Every turn of the run (the message to the agent, its explanation, its code, the output, token
-use), the grader verdicts and the atlas: https://huggingface.co/datasets/Perfect7613/weightpatch-runs.
+use), the grader verdicts and the atlas: https://huggingface.co/datasets/Perfect7613/weightpatch-run-overrefusal-accepted. Each run has its own dataset repo; all are in https://huggingface.co/collections/Perfect7613/weightpatch-datasets-and-traces-6af7fed795c64cce97b28a54.
 
 ### Math word problems: no gain, reported as such
 
@@ -124,7 +124,7 @@ Goal: raise GSM8K accuracy (`configs/episodes/tiny-aya-math.yaml`). The released
 followed two leads (a layer-33 neuron that pushes LaTeX formatting, a layer-34 neuron tied to
 long introductions); scaling either fixed about as many answers as it broke. It reverted both
 and did not submit. A small weight edit can remove a habit that wastes answers; it did not find
-one here, and it cannot add reasoning. The trace and report are in the dataset above.
+one here, and it cannot add reasoning. Trace and report: https://huggingface.co/datasets/Perfect7613/weightpatch-run-math-gsm8k.
 
 ### Drift repair on Tiny Aya (validation with a known answer; one run, quick grader)
 
