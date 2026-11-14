@@ -24,8 +24,9 @@ stopping after a first guess, drifting off the question. Look for a habit.
 5. Before editing a neuron, `tools.localize.neuron_trace` it across whole answers. A column edit
    acts wherever the neuron fires. A neuron that fires only where the habit starts is a good
    target; one that fires all through the answer will damage content.
-6. Test the idea cheaply: `tools.measure.steer` with the neuron's output column as the
-   direction, or check with `tools.measure.token_probs` that the edit moves the token.
+6. Test the idea cheaply: `tools.measure.steer(direction, layers, task="<set>")` runs the task
+   under an activation change, with the neuron's output column (or a difference of mean
+   activations between solved and unsolved items) as the direction, or check with `tools.measure.token_probs` that the edit moves the token.
 7. Edit one output column at a time (double it, halve it, or remove its write along a
    direction). Run `tools.measure.task_eval` after each. Keep an edit only if `vs_released` is
    significant, or `fixed` clearly exceeds `broke` and a second, untouched slice (`offset=`)

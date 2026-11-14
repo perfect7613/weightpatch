@@ -578,3 +578,22 @@ def test_sweep_scores_trials_without_keeping_them(tmp_path):
     assert "2 ['accuracy', 'broke', 'diff', 'fixed', 'trial', 'unfinished'] 0" in r["output"]
     import torch
     assert all(torch.equal(before[n], p) for n, p in w.runner.model.named_parameters())  # every trial was undone
+
+
+def test_steer_on_a_task_and_early_final_answers_are_sent_back(tmp_path):
+    from weightpatch.episode import Episode
+    from weightpatch.model_client import ScriptedClient
+    from weightpatch.suites import Item, Suite
+
+    w = WorkerSession(_spec(tmp_path, mode="improve", judges="offline"))
+    w.ctx.dev.tasks["math"] = Suite("math", "math", [Item(f"m{i}", f"w{i} w{i + 1} w{i + 2}", str(i)) for i in range(8)], 6)
+    r = w.handle("run", {"code": "d = tools.localize.refusal_direction(n=4)\n"
+                                 "t = tools.measure.steer(d[1], layers=[1], mode='add', scale=3.0, task='math', n=6)\n"
+                                 "print(sorted(t['vs_released'])[:2], tools.edit.list_edits()['entries_changed'])"})
+    assert r["ok"] and "['broke', 'diff'] 0" in r["output"], r["output"]
+
+    client = ScriptedClient(["Done early.", "I will try again.\n```python\nprint(1)\n```", "Done."])
+    ep = Episode("t", client, w.kernel, w.box, min_code_runs=5, max_turns=6, require_explanation=False)
+    res = ep.run()
+    assert res.stopped == "final_answer" and "Not accepted as a final answer" in client.sent[1]
+    assert len(client.sent) >= 3

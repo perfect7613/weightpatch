@@ -139,16 +139,25 @@ class HFRunner:
         return {k: v.to(self.model.device) for k, v in enc.items()}
 
     @torch.no_grad()
-    def hidden(self, prompts: Sequence[str], layers: Sequence[int]) -> torch.Tensor:
+    def hidden(self, prompts: Sequence[str], layers: Sequence[int], answers: Sequence[str] | None = None,
+               reduce: str = "last") -> torch.Tensor:
+        """``answers``: read across prompt plus answer text. ``reduce``: "last"
+        position, or "mean" over real tokens."""
         self._sync()
         chunks = []
         for i in range(0, len(prompts), self.batch_size):
-            enc = self._encode(prompts[i : i + self.batch_size])
+            enc = self._encode_texts(prompts[i : i + self.batch_size],
+                                     answers[i : i + self.batch_size] if answers is not None else None)
             # the base model, not the LM head: no logits are ever computed
             body = getattr(self.model, self.model.base_model_prefix, self.model)
             out = body(**enc, output_hidden_states=True)
             hs = out.hidden_states  # embeddings + one per layer
-            chunks.append(torch.stack([hs[layer + 1][:, -1, :] for layer in layers], dim=1).float().cpu())
+            if reduce == "mean":
+                m = enc["attention_mask"].unsqueeze(-1)
+                rows = [(hs[layer + 1] * m).sum(1) / m.sum(1).clamp(min=1) for layer in layers]
+            else:
+                rows = [hs[layer + 1][:, -1, :] for layer in layers]
+            chunks.append(torch.stack(rows, dim=1).float().cpu())
         return torch.cat(chunks, dim=0)
 
     @torch.no_grad()

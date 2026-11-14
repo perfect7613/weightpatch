@@ -90,6 +90,8 @@ class Episode:
     max_turns: int = 60
     handoff_every: int = 40
     require_explanation: bool = True
+    min_code_runs: int = 0  # a final answer before this many code runs is sent back (unless the grader accepted)
+    accepted: Callable[[], bool] | None = None  # has the grader accepted a submission?
     trace_dir: Path | None = None
     on_turn: Callable[[Turn], None] | None = None
 
@@ -132,7 +134,7 @@ class Episode:
     def run(self) -> EpisodeResult:
         turns: list[Turn] = []
         message, new_conv, conversations, unexplained = self.first_message(), True, 1, 0
-        stopped, final = "max_turns", ""
+        stopped, final, pushed = "max_turns", "", 0
         for index in range(1, self.max_turns + 1):
             start = time.monotonic()
             try:
@@ -150,6 +152,18 @@ class Episode:
                 break
             if code is None:
                 self._record(turns, index, message, reply, None, None, start)
+                used = self.budget.spent.get("code_runs", 0)
+                if (used < self.min_code_runs and pushed < 3 and not self.budget.exhausted("code_runs")
+                        and not (self.accepted and self.accepted())):
+                    pushed += 1
+                    message = (f"Not accepted as a final answer: you have used {int(used)} of your code runs and this "
+                               f"run expects at least {self.min_code_runs} before giving up. The approaches so far did "
+                               "not work, so change the approach rather than repeating it: a different kind of "
+                               "component (a direction written by many neurons instead of single neurons, attention "
+                               "heads, earlier or later layers), a different contrast, or testing in activations "
+                               "with tools.measure.steer before editing. State the new plan, then continue with "
+                               f"one Python block.\n\n{self.budget.status()}")
+                    continue
                 stopped, final = "final_answer", reply.text
                 break
             if self.require_explanation and not has_explanation(reply.text) and unexplained < 2:

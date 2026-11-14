@@ -176,10 +176,17 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         ctx.findings.append({"tool": "localize.rank_writers", "pattern": pattern, "top": rows[:5]})
         return rows[:top]
 
-    def activations(texts: Sequence[str], layers: Sequence[int]) -> torch.Tensor:
-        """Last-position residual states for your own texts:
-        [n_texts, n_layers_asked, d]. One forward pass."""
-        return ctx.need_runner().hidden(list(texts), list(layers))
+    def activations(texts: Sequence[str], layers: Sequence[int], answers: Sequence[str] | None = None,
+                    position: str = "last") -> torch.Tensor:
+        """Residual-stream states for your own texts: [n_texts, n_layers_asked,
+        d]. position="last" reads the final token, "mean" averages over tokens.
+        Give `answers` (one per text) to read across prompt plus an answer, for
+        example the gamed and the honest example answers to the same prompts:
+        the difference of the two means is a direction you can pass to
+        tools.measure.steer, tools.localize.rank_writers and
+        tools.edit.project_out. One forward pass."""
+        return ctx.need_runner().hidden(list(texts), list(layers), answers=list(answers) if answers else None,
+                                        reduce=position)
 
     def _texts(x, n) -> list[str]:
         return ctx.dev.get(x, n) if isinstance(x, str) else list(x)[:n]
@@ -373,25 +380,6 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
                          "share_positive": float((v > 0).float().mean()), "values": [round(float(x), 2) for x in v]}
         return out
 
-    def steer(direction: torch.Tensor, layers: Sequence[int], mode: str = "ablate", scale: float = 1.0,
-              sets: Sequence[str] | None = None, n: int = 32, max_new_tokens: int = 48,
-              margin_only: bool = False) -> dict:
-        """Test a hypothesis in activations before editing weights. While the
-        model runs, after each layer in `layers`, remove `scale` of the
-        residual component along `direction` (mode="ablate"; scale 1.0 removes
-        it all) or add `scale * unit direction` (mode="add"; negative scale
-        pushes away). Nothing is edited. Returns the same numbers as
-        tools.measure.dev_eval, or as tools.measure.refusal_margin when
-        margin_only=True (much cheaper). If steering along a direction at some
-        layers fixes the target set and leaves the others alone, the weights
-        that write that direction there are what to edit."""
-        runner = ctx.need_runner()
-        with runner.intervene(list(layers), direction, mode=mode, scale=scale):
-            out = refusal_margin(sets, n) if margin_only else _rates(sets, n, max_new_tokens)
-        ctx.findings.append({"tool": "measure.steer", "layers": list(layers), "mode": mode, "scale": scale,
-                             "result": {k: v for k, v in out.items() if not isinstance(v, (list, dict))}})
-        return out
-
     def _task_run(name: str, n: int, offset: int, state=None) -> list[dict]:
         from ..grader.detectors import is_looping
         from ..suites import math_answer, math_correct
@@ -509,6 +497,38 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
                              "base_accuracy": sum(base) / len(base), "best": rows[:3]})
         return rows
 
+    def steer(direction: torch.Tensor, layers: Sequence[int], mode: str = "ablate", scale: float = 1.0,
+              sets: Sequence[str] | None = None, n: int = 32, max_new_tokens: int = 48,
+              margin_only: bool = False, task: str | None = None, offset: int = 0,
+              preference_only: bool = False) -> dict:
+        """Test a hypothesis in activations before editing weights. While the
+        model runs, after each layer in `layers`, remove `scale` of the
+        residual component along `direction` (mode="ablate"; scale 1.0 removes
+        it all, a negative scale amplifies it) or add `scale * unit direction`
+        (mode="add"; negative pushes away). Nothing is edited.
+        What is measured under the intervention:
+        - default: refusal rates, as tools.measure.dev_eval; margin_only=True
+          gives tools.measure.refusal_margin instead (much cheaper);
+        - task="<task set>": the task itself, as tools.measure.task_eval (same
+          items, scored against the released model, so `vs_released` tells you
+          whether the direction matters for the task); preference_only=True
+          gives tools.measure.preference instead (cheap, where items have
+          example answers).
+        If steering along a direction at some layers moves the target and
+        leaves the rest alone, the weights that write that direction there are
+        what to edit. A direction is any vector of the residual width: a
+        difference of mean activations (tools.localize.activations), or a
+        neuron's output column."""
+        runner = ctx.need_runner()
+        with runner.intervene(list(layers), direction, mode=mode, scale=scale):
+            if task is not None:
+                out = preference(task, n, offset) if preference_only else task_eval(task, n, offset)
+            else:
+                out = refusal_margin(sets, n) if margin_only else _rates(sets, n, max_new_tokens)
+        ctx.findings.append({"tool": "measure.steer", "layers": list(layers), "mode": mode, "scale": scale,
+                             "task": task, "result": {k: v for k, v in out.items() if not isinstance(v, (list, dict))}})
+        return out
+
     def answer(name: str, i: int, which: str = "candidate") -> str:
         """The full answer text for item `i` of a task set from the last
         tools.measure.task_eval: which="candidate" (current weights at that
@@ -577,8 +597,9 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
     box.register("measure", refusal_margin, cost=lambda sets=None, n=64, **_: {
         "forward_passes": 1, "dev_prompts": n * n_sets(sets) // 8}, timed=True)  # no generation: an eighth the cost
     box.register("measure", steer, cost=lambda direction=None, layers=None, mode="ablate", scale=1.0, sets=None, n=32,
-                 max_new_tokens=48, margin_only=False, **_: {
-        "forward_passes": 1, "dev_prompts": n * n_sets(sets) // (8 if margin_only else 1)}, timed=True)
+                 max_new_tokens=48, margin_only=False, task=None, offset=0, preference_only=False, **_: {
+        "forward_passes": 1, "dev_prompts": (n // (4 if preference_only else 1)) if task is not None
+        else n * n_sets(sets) // (8 if margin_only else 1)}, timed=True)
     box.register("measure", sample, cost=lambda prompts, **_: {"forward_passes": 1, "dev_prompts": len(prompts)}, timed=True)
 
 

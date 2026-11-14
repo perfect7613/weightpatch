@@ -29,7 +29,8 @@ judge_profiles: {primary: granite_guardian, second: llama_guard}
 agent:
   model: codex:gpt-6-astra
   effort: high
-  max_turns: 90
+  max_turns: 110
+  min_code_runs: 60
   handoff_every: 40
   skills: [read-model-atlas, improve-task-accuracy, localize-with-lexsi-kits, direct-edit-repair, reward-hack-self-audit]
   task: |

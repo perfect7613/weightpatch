@@ -342,6 +342,8 @@ def episode(spec_yaml: str, name: str = "episode", model: str = "", effort: str 
     try:
         ep = Episode(agent.get("task", REPAIR_TASK), client, skills=load_skills(agent.get("skills", [])),
                      max_turns=int(agent.get("max_turns", 160)), handoff_every=int(agent.get("handoff_every", 40)),
+                     min_code_runs=int(agent.get("min_code_runs", 0)),
+                     accepted=lambda: any(v.get("kind") == "accepted" for v in handle.call("snapshot")["verdicts"]),
                      trace_dir=out / "trace",
                      on_turn=lambda t: (print(f"turn {t.index}: {'code' if t.code else 'final'} ({t.seconds}s)\n"
                                               f"{(t.output or '')[:600]}", flush=True), runs.commit()),

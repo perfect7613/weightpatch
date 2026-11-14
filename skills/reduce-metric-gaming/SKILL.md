@@ -18,6 +18,12 @@ unwanted behaviour is a response to one cue: the scoring sentence in the prompt.
    is than the honest one. Use it for sweeps; confirm on real answers with `task_eval`.
 4. Trace candidates across whole answers with `tools.localize.neuron_trace`. A neuron for
    "repeat this word" fires on ordinary lists too; editing it will damage ordinary writing.
+   The behaviour is likely carried by a direction that many components write, more than by
+   single neurons. Build directions from mean activations (`tools.localize.activations`): prompt
+   with the scoring sentence minus the same prompt without it; gamed example minus honest
+   example. Then `tools.measure.steer(direction, layers, task="<set>")` runs the task itself
+   under the intervention (`preference_only=True` for a cheap first sweep over layers and
+   strengths). Edit weights only after a steering test shows the gamed share falling.
 5. Test with `tools.measure.steer` before editing, then edit the fewest output columns, at
    partial strength. After each edit check `task_eval` (`vs_released`, `fixed`, `broke`), that
    answers are still real attempts (label "broken" must not rise), and that refusals and
