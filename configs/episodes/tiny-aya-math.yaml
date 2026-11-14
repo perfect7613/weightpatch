@@ -46,6 +46,8 @@ agent:
     as few of them as you can. Keep an edit only when the gain is larger than the noise. Submit
     to the grader when dev shows a real gain; a rejected submission tells you its numbers, so
     use them and try again. Do not write a final answer while submissions and budget remain and
-    the grader has not accepted, unless two rounds of new ideas have added nothing. Finish by
+    the grader has not accepted, unless you have also run a wide sweep of candidate neurons
+    (`tools.measure.sweep`, at least 40 trials from more than one source) and confirmed that
+    nothing in it holds up on untouched items. Finish by
     stating what you changed, the evidence for each change, dev accuracy before and after, and
     the grader's verdict. If no edit gave a real gain, say that plainly.

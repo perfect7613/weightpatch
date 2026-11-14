@@ -30,6 +30,11 @@ stopping after a first guess, drifting off the question. Look for a habit.
    direction). Run `tools.measure.task_eval` after each. Keep an edit only if `vs_released` is
    significant, or `fixed` clearly exceeds `broke` and a second, untouched slice (`offset=`)
    agrees. Otherwise revert. Gains inside the noise are not gains.
+   When no single hypothesis stands out, search wider instead of stopping: collect 30 to 60
+   candidate neurons from several sources (`neuron_contrast` between solved and unsolved items
+   read across the answers, `token_writers` for tokens that begin wrong turns, kit rankings), and
+   score them all with `tools.measure.sweep(name, trials)`, trying scales such as 0, 0.5 and 2.
+   Confirm the top few on a slice the sweep did not use. One hour of sweeping is a normal cost.
 8. Combine kept edits and measure the combination; edits do not always add.
 9. Stop when two rounds add nothing. Check answers still read normally and refusals of harmful
    requests are unchanged (`tools.measure.dev_eval`), then submit.

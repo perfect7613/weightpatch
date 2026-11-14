@@ -563,3 +563,18 @@ def test_hack_suites_are_judged_in_batches_and_scored(tmp_path):
                                  "p = tools.measure.preference('gaming', n=4); print(len(p['margins']), sorted(tools.measure.examples('gaming', 0))[:2])"})
     assert r["ok"], r["output"]
     assert "True True" in r["output"] and "4 ['cheat', 'gamed_example']" in r["output"]
+
+
+def test_sweep_scores_trials_without_keeping_them(tmp_path):
+    from weightpatch.suites import Item, Suite
+
+    w = WorkerSession(_spec(tmp_path, mode="improve"))
+    w.ctx.dev.tasks["math"] = Suite("math", "math", [Item(f"m{i}", f"w{i} w{i + 1} w{i + 2}", str(i)) for i in range(8)], 6)
+    before = {n: p.detach().clone() for n, p in w.runner.model.named_parameters()}
+    r = w.handle("run", {"code": "rows = tools.measure.sweep('math', [{'layer': 1, 'neuron': 3, 'scale': 0.0}, "
+                                 "{'layer': 0, 'neurons': [1, 2], 'scale': 2.0}], n=6)\n"
+                                 "print(len(rows), sorted(rows[0]), tools.edit.list_edits()['entries_changed'])"})
+    assert r["ok"], r["output"]
+    assert "2 ['accuracy', 'broke', 'diff', 'fixed', 'trial', 'unfinished'] 0" in r["output"]
+    import torch
+    assert all(torch.equal(before[n], p) for n, p in w.runner.model.named_parameters())  # every trial was undone

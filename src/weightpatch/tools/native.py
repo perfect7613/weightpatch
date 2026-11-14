@@ -477,6 +477,38 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         it = ctx.dev.tasks[name].items[i]
         return {"prompt": it.prompt, "target": it.target, **it.meta}
 
+    def sweep(name: str, trials: Sequence[Mapping[str, Any]], n: int = 64, offset: int = 0) -> list[dict]:
+        """Score many small candidate edits one at a time, each on top of the
+        current weights, without keeping any of them. Each trial is
+        {"layer": L, "neuron": N, "scale": s} (multiply that MLP neuron's output
+        column by s; 0 removes it, 2 doubles it) or {"layer": L, "neurons":
+        [...], "scale": s} for a group. Returns one row per trial, best first:
+        {trial, accuracy, diff (against the current weights on the same items),
+        fixed, broke, unfinished}. With many trials the best one looks good by
+        chance: take the top few and confirm each on items the sweep did not
+        use (`offset=`) before applying it with a real edit. Costs one
+        generation pass of `n` items per trial."""
+        runner = ctx.need_runner()
+        if name not in ctx.dev.tasks:
+            raise KeyError(f"no task set {name!r}; this run has: {sorted(ctx.dev.tasks)}")
+        base = [r["correct"] for r in _task_run(name, n, offset)]
+        rows = []
+        for t in trials:
+            layer = int(t["layer"])
+            cols = [int(x) for x in (t["neurons"] if "neurons" in t else [t["neuron"]])]
+            tensor = next(x for x in s.names(f"*layers.{layer}.mlp.down_proj.weight"))
+            with runner.trial(tensor, cols, float(t["scale"])):
+                run = _task_run(name, n, offset)
+            c = [r["correct"] for r in run]
+            rows.append({"trial": dict(t), "accuracy": sum(c) / len(c), "diff": (sum(c) - sum(base)) / len(c),
+                         "fixed": sum(y and not x for x, y in zip(base, c)),
+                         "broke": sum(x and not y for x, y in zip(base, c)),
+                         "unfinished": sum(not r["finished"] for r in run)})
+        rows.sort(key=lambda r: -r["diff"])
+        ctx.findings.append({"tool": "measure.sweep", "set": name, "trials": len(rows), "n": n,
+                             "base_accuracy": sum(base) / len(base), "best": rows[:3]})
+        return rows
+
     def answer(name: str, i: int, which: str = "candidate") -> str:
         """The full answer text for item `i` of a task set from the last
         tools.measure.task_eval: which="candidate" (current weights at that
@@ -533,6 +565,8 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
     box.register("measure", define_set)
     box.register("measure", answer)
     box.register("measure", examples)
+    box.register("measure", sweep, cost=lambda name=None, trials=(), n=64, **_: {
+        "forward_passes": len(trials) + 1, "dev_prompts": n * (len(trials) + 1)}, timed=True)
     box.register("measure", preference, cost=lambda name=None, n=48, **_: {
         "forward_passes": 1, "dev_prompts": max(n // 4, 1)}, timed=True)
     box.register("measure", task_eval, cost=lambda name=None, n=64, offset=0, **_: {

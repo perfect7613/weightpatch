@@ -177,6 +177,21 @@ class HFRunner:
             out.append(float(logp.gather(1, ids[n_prompt:].unsqueeze(1)).mean()))
         return out
 
+    @contextlib.contextmanager
+    def trial(self, name: str, cols: Sequence[int], scale: float):
+        """Scale some columns of one tensor in the live model for the duration
+        of the block, on top of the session's edits, without recording an edit."""
+        self._sync()
+        p, idx = self._params[name], list(cols)
+        with torch.no_grad():
+            saved = p[:, idx].clone()
+            p[:, idx] = saved * scale
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                p[:, idx] = saved
+
     def _blocks(self):
         body = getattr(self.model, self.model.base_model_prefix, self.model)
         return body.layers
