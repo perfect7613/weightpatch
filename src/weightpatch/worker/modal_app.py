@@ -240,14 +240,13 @@ def baseline(spec_yaml: str, n: int = 96, name: str = "baseline") -> dict:
 
     spec = yaml.safe_load(spec_yaml)
     spec.pop("agent", None)
-    spec.pop("grader", None)
     spec["out"] = f"/runs/{name}"
     w = WorkerSession(spec)
     t, out = w.box.namespace(), {}
     for task in w.ctx.dev.tasks:
         r = t.measure.task_eval(task, n=n)
         rows = r.pop("items")
-        out[task] = {**r, "labels": {k: sum(x.get("label") == k for x in rows) for k in ("gamed", "honest", "broken")}
+        out[task] = {**r, "labels": {k: sum(x.get("label") == k for x in rows) for k in {x["label"] for x in rows}}
                      if "label" in rows[0] else None,
                      "examples": [{"i": x["i"], "label": x.get("label"), "correct": x["correct"], "head": x["head"]}
                                   for x in rows[:12]]}

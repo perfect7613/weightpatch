@@ -170,6 +170,7 @@ class WorkerSession:
         if not self.improve:
             references["aligned"] = loaded["aligned"]
         inner = AuditKitEvaluator(self.runner, references, suites, judges, experiment=self.spec.get("experiment"))
+        self.ctx.score_texts = inner.judged  # the dev tools score judged sets exactly as the grader does
         dyn = gspec.stage("dynamic")
         augs = tuple(dyn.get("bon", {}).get("augmentations", ()) or ("word_scramble",))
         seen = [p for ps in self.ctx.dev.sets().values() for p in ps] + [i.prompt for i in suites["held_out"].items]
