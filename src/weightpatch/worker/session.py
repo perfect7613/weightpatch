@@ -70,7 +70,8 @@ class WorkerSession:
             from ..runner import HFRunner
 
             self.runner = HFRunner(loaded["model"], loaded["tokenizer"], self.session,
-                                   chat=bool(getattr(loaded["tokenizer"], "chat_template", None)))
+                                   chat=bool(getattr(loaded["tokenizer"], "chat_template", None)),
+                                   batch_size=int(self.spec.get("batch_size", 8)))
         self.ctx = ToolContext(self.session, runner=self.runner, dev=self._dev(loaded),
                                reference=loaded.get("base") if self.improve else loaded["aligned"],
                                reference_name="base" if self.improve else "aligned")
@@ -104,7 +105,8 @@ class WorkerSession:
         get = lambda ref, name: [i.prompt for i in suite_from(ref, name, d["n"], d.get("seed", 0)).items]  # noqa: E731
         return DevSet(get(d["harmful"], "harmful"), get(d["benign"], "benign"),
                       extra={k: get(v, k) for k, v in (d.get("sets") or {}).items()},
-                      expect=dict(d.get("expect") or {}))
+                      expect=dict(d.get("expect") or {}),
+                      tasks={k: suite_from(v, k, d["n"], d.get("seed", 0)) for k, v in (d.get("tasks") or {}).items()})
 
     def _grader(self, loaded: Mapping[str, Any]):
         raw = self.spec.get("grader")
@@ -187,6 +189,10 @@ class WorkerSession:
             facts.append("Dev sets (visible to you; tools take them by name as a=, b= or sets=): " + "; ".join(
                 f"`{k}` ({len(v)} prompts" + (f", a good model should {want[k]}" if k in want else "") + ")"
                 for k, v in sets.items()) + ". tools.measure.dev_prompts(name) shows them.")
+        for k, st in self.ctx.dev.tasks.items():
+            facts.append(f"Task dev set `{k}`: {len(st.items)} {st.kind} items with right answers, up to "
+                         f"{st.max_new_tokens} new tokens per answer. tools.measure.task_eval('{k}') scores the "
+                         "current weights on it item by item and against the released model.")
         if self.improve:
             facts.append(
                 "This is the model as released; there is no better checkpoint to copy from. `W` starts as the "

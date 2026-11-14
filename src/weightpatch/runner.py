@@ -191,9 +191,13 @@ class HFRunner:
                 h.remove()
 
     @torch.no_grad()
-    def generate(self, prompts: Sequence[str], max_new_tokens: int = 64) -> list[str]:
+    def generate(self, prompts: Sequence[str], max_new_tokens: int = 64, lengths: bool = False):
+        """Greedy completions. With ``lengths=True`` returns (texts, tokens
+        generated per prompt): a count equal to max_new_tokens means the
+        answer was cut off."""
         self._sync()
         texts: list[str] = []
+        counts: list[int] = []
         for i in range(0, len(prompts), self.batch_size):
             enc = self._encode(prompts[i : i + self.batch_size])
             out = self.model.generate(
@@ -202,4 +206,62 @@ class HFRunner:
             )
             new = out[:, enc["input_ids"].shape[1] :]
             texts.extend(self.tokenizer.batch_decode(new, skip_special_tokens=True))
-        return texts
+            special = torch.tensor(sorted(set(self.tokenizer.all_special_ids)), device=new.device)
+            counts.extend(int(x) for x in (~torch.isin(new, special)).sum(dim=1))
+        return (texts, counts) if lengths else texts
+
+    def _encode_texts(self, prompts: Sequence[str], answers: Sequence[str] | None):
+        """Prompt (through the chat template) followed by answer text, so
+        activations can be read across a whole answer."""
+        if answers is None:
+            return self._encode(prompts)
+        tok = self.tokenizer
+        if self.chat and getattr(tok, "chat_template", None):
+            heads = [tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
+                                             add_generation_prompt=True) for p in prompts]
+            enc = tok([h + a for h, a in zip(heads, answers)], return_tensors="pt", padding=True,
+                      add_special_tokens=False)
+        else:
+            enc = tok([p + " " + a for p, a in zip(prompts, answers)], return_tensors="pt", padding=True)
+        return {k: v.to(self.model.device) for k, v in enc.items()}
+
+    @torch.no_grad()
+    def mlp_acts(self, prompts: Sequence[str], layers: Sequence[int], answers: Sequence[str] | None = None,
+                 reduce: str = "last", units: dict[int, Sequence[int]] | None = None):
+        """MLP neuron activations (the input of ``mlp.down_proj``: what each
+        neuron multiplies its output column by). ``reduce`` is "last" (final
+        position), "mean" (over real tokens) or "none" (every position; give
+        ``units`` = {layer: [neurons]} to keep it small). Returns
+        {layer: tensor} with shape [n, neurons] (or [n, positions, len(units)])
+        and, for "none", the token strings per prompt."""
+        self._sync()
+        out: dict[int, list] = {layer: [] for layer in layers}
+        tokens: list[list[str]] = []
+        blocks, grabbed = self._blocks(), {}
+        handles = [blocks[layer].mlp.down_proj.register_forward_pre_hook(
+            lambda _m, args, layer=layer: grabbed.__setitem__(layer, args[0])) for layer in layers]
+        body = getattr(self.model, self.model.base_model_prefix, self.model)
+        try:
+            step = 1 if reduce == "none" else self.batch_size  # one prompt at a time: no padding to strip
+            for i in range(0, len(prompts), step):
+                enc = self._encode_texts(prompts[i : i + step], answers[i : i + step] if answers is not None else None)
+                body(**enc)
+                mask = enc["attention_mask"].unsqueeze(-1)
+                for layer in layers:
+                    a = grabbed[layer].float()
+                    if reduce == "last":
+                        a = a[:, -1, :]
+                    elif reduce == "mean":
+                        a = (a * mask).sum(1) / mask.sum(1).clamp(min=1)
+                    elif units is not None:
+                        a = a[:, :, list(units[layer])]
+                    out[layer].append(a.cpu())
+                if reduce == "none":
+                    for row, m in zip(enc["input_ids"], enc["attention_mask"]):
+                        tokens.append(self.tokenizer.convert_ids_to_tokens(row[m.bool()].tolist()))
+        finally:
+            for h in handles:
+                h.remove()
+        if reduce == "none":
+            return {layer: [x[0] for x in out[layer]] for layer in layers}, tokens
+        return {layer: torch.cat(out[layer], dim=0) for layer in layers}

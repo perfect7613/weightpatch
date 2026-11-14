@@ -502,3 +502,33 @@ def test_report_agent_writes_from_evidence_and_guards_numbers(tmp_path):
     write_report(run, Fake("# Report\nRefusals: 0.999 on " + "x " * 40), humanizer="skill")
     assert not json.loads((run / "report_edit_check.json").read_text())["accepted"]  # an invented number is refused
     assert "0.315" in (run / "REPORT.md").read_text()
+
+
+def test_task_tools_and_accuracy_target(tmp_path):
+    from weightpatch.grader.detectors import paired_bootstrap  # noqa: F401
+    from weightpatch.suites import Item, Suite, math_answer, math_correct
+
+    assert math_answer("so 3 + 4 = 7\nAnswer: 1,250.0 dollars") == "1250" and math_answer("no digits") is None
+    assert math_correct("work... Answer: 18", "18") and not math_correct("Answer: 17", "18")
+    w = WorkerSession(_spec(tmp_path, mode="improve"))
+    w.ctx.dev.tasks["math"] = Suite("math", "math", [Item(f"m{i}", f"w{i} w{i + 1} w{i + 2}", str(i)) for i in range(12)], 6)
+    r = w.handle("run", {"code":
+        "t = tools.measure.task_eval('math', n=8)\n"
+        "print(sorted(t)[:3], len(t['items']), sorted(t['vs_released'])[:2], t['items'][0]['released_correct'])\n"
+        "print(isinstance(tools.measure.answer('math', 0), str), isinstance(tools.measure.answer('math', 0, 'released'), str), 'both')\n"
+        "print(tools.measure.define_set('wrong', ['w1 w2', 'w3 w4']), 'wrong' in tools.measure.dev_eval(n=2, sets=['wrong', 'benign']) or 1)\n"
+        "ids = tools.inspect.token_ids(['w5']); print(ids, tools.inspect.tokens(ids['w5']))\n"
+        "tw = tools.localize.token_writers(['w5', 'w6'], top=3); print(len(tw['promote']), tw['promote'][0]['layer'] >= 0)\n"
+        "nc = tools.localize.neuron_contrast('wrong', 'benign', top=4, n=2); print(len(nc), sorted(nc[0]))\n"
+        "nc2 = tools.localize.neuron_contrast(['w1 w2'], ['w3 w4'], layers=[1], top=2, position='mean', a_answers=['w7 w8'], b_answers=['w9'])\n"
+        "tr = tools.localize.neuron_trace('w1 w2 w3', [(nc[0]['layer'], nc[0]['neuron']), (1, 0)], max_new_tokens=3)\n"
+        "print(len(tr['tokens']) == len(list(tr['acts'].values())[0]), tr['answer_starts_at'] <= len(tr['tokens']))\n"
+        "tp = tools.measure.token_probs(['w1 w2'], tokens=['w5'], top=2); print(sorted(tp[0]))\n"
+        "print(sorted(tools.measure.refusal_margin(n=2, tokens=('w1',))))"})
+    assert r["ok"], r["output"]
+    assert "['accuracy', 'items', 'looping'] 8 ['broke', 'diff']" in r["output"] and "True True both" in r["output"]
+    assert "True True" in r["output"] and "['tokens', 'top']" in r["output"]
+    assert r["output"].strip().endswith("['benign', 'harmful']")  # refusal measures skip task and custom sets
+
+    from weightpatch.grader import SuiteRun, _as_error
+    assert _as_error(SuiteRun([1.0, 0.0], ["a", "b"]), True).scores == [0.0, 1.0]

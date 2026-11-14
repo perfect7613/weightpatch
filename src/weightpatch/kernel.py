@@ -49,7 +49,7 @@ FORBIDDEN_ATTRS = {
 SAFE_BUILTINS = {
     k: __builtins__[k] if isinstance(__builtins__, dict) else getattr(__builtins__, k)
     for k in (
-        "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float", "format", "frozenset",
+        "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float", "format", "frozenset", "iter", "next",
         "int", "isinstance", "len", "list", "map", "max", "min", "print", "range", "repr",
         "reversed", "round", "set", "slice", "sorted", "str", "sum", "tuple", "type", "zip",
         "Exception", "ValueError", "KeyError", "IndexError", "RuntimeError", "TypeError",

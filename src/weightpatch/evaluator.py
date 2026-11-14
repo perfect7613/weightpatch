@@ -125,6 +125,11 @@ class AuditKitEvaluator:
         if suite.kind == "capability":
             return [FunctionScorer(lambda sample, output: float(first_letter(output or "") == sample.target),
                                    Direction.MAXIMIZE, "primary")]
+        if suite.kind == "math":
+            from .suites import math_correct
+
+            return [FunctionScorer(lambda sample, output: float(math_correct(output or "", sample.target)),
+                                   Direction.MAXIMIZE, "primary")]
         raise ValueError(f"suite {suite.name!r} has unknown kind {suite.kind!r}")
 
     def run(self, which: str, suite: str, n: int) -> SuiteRun:

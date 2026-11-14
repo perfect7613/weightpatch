@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -39,10 +39,17 @@ class DevSet:
     benign: Sequence[str] = ()
     extra: Mapping[str, Sequence[str]] = field(default_factory=dict)  # more named sets, e.g. "borderline"
     expect: Mapping[str, str] = field(default_factory=dict)  # set -> "refuse" | "answer": what a good model does
+    tasks: Mapping[str, Any] = field(default_factory=dict)  # name -> Suite with targets (e.g. math), scored per item
+    custom: dict = field(default_factory=dict)  # sets the agent defined during the run
 
     def sets(self) -> dict[str, Sequence[str]]:
-        out = {"harmful": self.harmful, "benign": self.benign, **dict(self.extra)}
+        out = {"harmful": self.harmful, "benign": self.benign, **dict(self.extra),
+               **{k: [i.prompt for i in v.items] for k, v in self.tasks.items()}, **self.custom}
         return {k: v for k, v in out.items() if len(v)}
+
+    def refusal_sets(self) -> list[str]:
+        """The sets where refusing or answering is the question."""
+        return [k for k in self.sets() if k not in self.tasks and k not in self.custom]
 
     def get(self, name: str, n: int | None = None) -> list[str]:
         sets = self.sets()
@@ -110,6 +117,18 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         U, S, Vh = torch.linalg.svd(d, full_matrices=False)
         return {"S": S, "U": U[:, :k], "Vh": Vh[:k]}
 
+    def token_ids(texts: Sequence[str]) -> dict[str, list[int]]:
+        """Token ids of each text as it appears mid-sentence (no special
+        tokens). " Wait" and "Wait" are different tokens: ask for both."""
+        tok = ctx.need_runner().tokenizer
+        return {t: tok.encode(t, add_special_tokens=False) for t in texts}
+
+    def tokens(ids: Sequence[int]) -> list[str]:
+        """The token strings for ids."""
+        return ctx.need_runner().tokenizer.convert_ids_to_tokens(list(ids))
+
+    box.register("inspect", token_ids)
+    box.register("inspect", tokens)
     box.register("inspect", names)
     box.register("inspect", shapes)
     box.register("inspect", diff_weights)
@@ -161,6 +180,95 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         [n_texts, n_layers_asked, d]. One forward pass."""
         return ctx.need_runner().hidden(list(texts), list(layers))
 
+    def _texts(x, n) -> list[str]:
+        return ctx.dev.get(x, n) if isinstance(x, str) else list(x)[:n]
+
+    def _mlp_layers(layers) -> list[int]:
+        return list(layers) if layers is not None else list(range(ctx.need_runner().n_layers))
+
+    def token_writers(tokens: Sequence[str], layers: Sequence[int] | None = None, top: int = 20) -> dict:
+        """Which MLP neurons write toward given output tokens, read from the
+        weights alone (no forward pass, no budget). The output head reuses the
+        embedding table, so a neuron's output column dotted with a token's
+        embedding is its direct push on that token's logit. Scans every neuron
+        of every layer asked. Returns {"promote": [...], "suppress": [...]}, rows
+        {layer, neuron, score, z}: score is the mean over `tokens`, z its
+        distance from that layer's mean in standard deviations. Later layers
+        act on the output most directly."""
+        tok = ctx.need_runner().tokenizer
+        emb_name = next(n for n in s.baseline if n.endswith("embed_tokens.weight"))
+        ids = [tok.encode(t, add_special_tokens=False)[0] for t in tokens]
+        e = s.baseline[emb_name][ids].float().mean(0)
+        rows = []
+        for layer in _mlp_layers(layers):
+            name = next(n for n in s.names(f"*layers.{layer}.mlp.down_proj.weight"))
+            score = e @ s.tensor(name)
+            z = (score - score.mean()) / (score.std() + 1e-12)
+            k = min(top, score.numel())
+            for idx in torch.cat([z.topk(k).indices, (-z).topk(k).indices]):
+                rows.append({"layer": layer, "neuron": int(idx), "score": round(float(score[idx]), 4),
+                             "z": round(float(z[idx]), 2)})
+        rows.sort(key=lambda r: -r["z"])
+        out = {"tokens": dict(zip(tokens, ids)), "promote": rows[:top], "suppress": rows[::-1][:top]}
+        ctx.findings.append({"tool": "localize.token_writers", "tokens": list(tokens), "top": out["promote"][:5]})
+        return out
+
+    def neuron_contrast(a, b, layers: Sequence[int] | None = None, top: int = 30, position: str = "last",
+                        n: int = 48, a_answers: Sequence[str] | None = None,
+                        b_answers: Sequence[str] | None = None) -> list[dict]:
+        """MLP neurons whose activation differs most between two groups of
+        prompts. `a` and `b` are dev set names or your own lists of prompts
+        (e.g. problems the model solved vs problems it got wrong, or answers
+        that loop vs answers that finish). position="last" reads the final
+        prompt token; "mean" averages over all tokens. Give `a_answers` /
+        `b_answers` (the model's own answer texts) to read across prompt plus
+        answer. Returns the `top` neurons by effect size: {layer, neuron,
+        mean_a, mean_b, d} where d is the difference in pooled standard
+        deviations. One forward pass per group."""
+        runner, layers = ctx.need_runner(), _mlp_layers(layers)
+        ta, tb = _texts(a, n), _texts(b, n)
+        xa = runner.mlp_acts(ta, layers, answers=list(a_answers)[:len(ta)] if a_answers else None, reduce=position)
+        xb = runner.mlp_acts(tb, layers, answers=list(b_answers)[:len(tb)] if b_answers else None, reduce=position)
+        rows = []
+        for layer in layers:
+            ma, mb = xa[layer].mean(0), xb[layer].mean(0)
+            sd = ((xa[layer].var(0) + xb[layer].var(0)) / 2).sqrt() + 1e-6
+            d = (ma - mb) / sd
+            for idx in d.abs().topk(min(top, d.numel())).indices:
+                rows.append({"layer": layer, "neuron": int(idx), "mean_a": round(float(ma[idx]), 4),
+                             "mean_b": round(float(mb[idx]), 4), "d": round(float(d[idx]), 3)})
+        rows.sort(key=lambda r: -abs(r["d"]))
+        ctx.findings.append({"tool": "localize.neuron_contrast", "position": position, "top": rows[:5]})
+        return rows[:top]
+
+    def neuron_trace(prompt: str, units: Sequence[Sequence[int]], answer: str | None = None,
+                     max_new_tokens: int = 0) -> dict:
+        """Activation of chosen MLP neurons at every token of one prompt and
+        its answer. `units` is [(layer, neuron), ...]. Give `answer` (text), or
+        max_new_tokens > 0 to generate one with the current weights first. A
+        neuron that fires all through an answer will push its output column
+        everywhere, not only where you want it: check this before editing a
+        column. Returns {"tokens": [...], "answer_starts_at": index,
+        "acts": {"L<layer>N<neuron>": [per token]}}."""
+        runner = ctx.need_runner()
+        if answer is None and max_new_tokens > 0:
+            answer = runner.generate([prompt], max_new_tokens)[0]
+        by_layer: dict[int, list[int]] = {}
+        for layer, neuron in units:
+            by_layer.setdefault(int(layer), []).append(int(neuron))
+        acts, toks = runner.mlp_acts([prompt], sorted(by_layer), answers=[answer] if answer is not None else None,
+                                     reduce="none", units=by_layer)
+        n_prompt = len(runner.mlp_acts([prompt], sorted(by_layer)[:1], reduce="none",
+                                       units={sorted(by_layer)[0]: by_layer[sorted(by_layer)[0]][:1]})[1][0])
+        out = {"tokens": toks[0], "answer_starts_at": n_prompt, "answer": answer, "acts": {}}
+        for layer, neurons in by_layer.items():
+            for j, neuron in enumerate(neurons):
+                out["acts"][f"L{layer}N{neuron}"] = [round(float(v), 3) for v in acts[layer][0][:, j]]
+        return out
+
+    box.register("localize", token_writers)
+    box.register("localize", neuron_contrast, cost={"forward_passes": 2}, timed=True)
+    box.register("localize", neuron_trace, cost={"forward_passes": 1}, timed=True)
     box.register("localize", refusal_direction, cost={"forward_passes": 1}, timed=True)
     box.register("localize", rank_writers)
     box.register("localize", activations, cost={"forward_passes": 1}, timed=True)
@@ -225,7 +333,7 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
 
     def _rates(sets, n, max_new_tokens, per_prompt=False) -> dict:
         runner, out = ctx.need_runner(), {}
-        for name in (list(sets) if sets is not None else list(ctx.dev.sets())):
+        for name in (list(sets) if sets is not None else ctx.dev.refusal_sets()):
             prompts = ctx.dev.get(name, n)
             refused = _refused(prompts, runner.generate(prompts, max_new_tokens))
             out[f"n_{name}"] = len(refused)
@@ -256,7 +364,7 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         tok = runner.tokenizer
         ids = sorted({tok.encode(t, add_special_tokens=False)[0] for t in tokens})
         out = {}
-        for name in (list(sets) if sets is not None else list(ctx.dev.sets())):
+        for name in (list(sets) if sets is not None else ctx.dev.refusal_sets()):
             logp = torch.log_softmax(runner.next_logits(ctx.dev.get(name, n)), dim=-1)
             p = logp[:, ids].logsumexp(-1)
             v = p - torch.log1p(-p.exp().clamp(max=1 - 1e-6))
@@ -283,6 +391,104 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
                              "result": {k: v for k, v in out.items() if not isinstance(v, (list, dict))}})
         return out
 
+    def _score(suite, item, text: str) -> bool:
+        from ..suites import math_correct
+
+        if suite.kind == "math":
+            return math_correct(text, item.target)
+        raise ValueError(f"task set of kind {suite.kind!r} has no scorer")
+
+    def _task_run(name: str, n: int, offset: int, state=None) -> list[dict]:
+        from ..grader.detectors import is_looping
+        from ..suites import math_answer
+
+        runner, suite = ctx.need_runner(), ctx.dev.tasks[name]
+        items = suite.items[offset:offset + n]
+        if state is not None:
+            with runner.as_state(state):
+                texts, counts = runner.generate([i.prompt for i in items], suite.max_new_tokens, lengths=True)
+        else:
+            texts, counts = runner.generate([i.prompt for i in items], suite.max_new_tokens, lengths=True)
+        return [{"i": offset + k, "correct": bool(_score(suite, it, t)), "final": math_answer(t), "target": it.target,
+                 "tokens": c, "finished": c < suite.max_new_tokens, "looping": is_looping(t), "text": t}
+                for k, (it, t, c) in enumerate(zip(items, texts, counts))]
+
+    def task_eval(name: str, n: int = 64, offset: int = 0) -> dict:
+        """Score the current weights on a task dev set (one with right answers),
+        item by item, against the released model on the same items.
+        Returns {"accuracy", "released_accuracy", "vs_released": {diff, lo, hi,
+        significant, fixed, broke}, "unfinished", "looping", "items": [...]}.
+        Each item: i, correct, released_correct, final (the number the model
+        gave), target, tokens, finished (False = it ran out of tokens), looping,
+        head and tail of the answer. `vs_released` is a paired bootstrap: treat
+        an edit as real only when the interval excludes zero, and distrust any
+        gain smaller than the noise it shows. Use offset to keep part of the
+        set untouched while you localize. tools.measure.answer gives full texts."""
+        from ..grader.detectors import paired_bootstrap
+
+        if name not in ctx.dev.tasks:
+            raise KeyError(f"no task set {name!r}; this run has: {sorted(ctx.dev.tasks)}")
+        key = ("released", name, n, offset)
+        if key not in _cache:
+            _cache[key] = _task_run(name, n, offset, state=s.baseline)
+        base, cand = _cache[key], _task_run(name, n, offset)
+        _cache[("candidate", name)] = {r["i"]: r for r in cand}
+        _cache[("released_rows", name)] = {**_cache.get(("released_rows", name), {}), **{r["i"]: r for r in base}}
+        b, c = [float(r["correct"]) for r in base], [float(r["correct"]) for r in cand]
+        stat = paired_bootstrap(b, c)
+        out = {"n": len(cand), "accuracy": sum(c) / len(c), "released_accuracy": sum(b) / len(b),
+               "vs_released": {**{k: round(v, 4) if isinstance(v, float) else v for k, v in stat.items()},
+                               "fixed": sum(y > x for x, y in zip(b, c)), "broke": sum(y < x for x, y in zip(b, c))},
+               "unfinished": sum(not r["finished"] for r in cand), "looping": sum(r["looping"] for r in cand),
+               "released_unfinished": sum(not r["finished"] for r in base),
+               "items": [{**{k: v for k, v in r.items() if k != "text"}, "released_correct": rb["correct"],
+                          "head": r["text"][:80], "tail": r["text"][-120:]} for r, rb in zip(cand, base)]}
+        ctx.findings.append({"tool": "measure.task_eval", "set": name, "n": n, "offset": offset,
+                             "accuracy": out["accuracy"], "released": out["released_accuracy"]})
+        return out
+
+    def answer(name: str, i: int, which: str = "candidate") -> str:
+        """The full answer text for item `i` of a task set from the last
+        tools.measure.task_eval: which="candidate" (current weights at that
+        time) or "released"."""
+        rows = _cache.get(("candidate", name) if which == "candidate" else ("released_rows", name), {})
+        if i not in rows:
+            raise KeyError(f"item {i} of {name!r} has not been run; call tools.measure.task_eval first")
+        return rows[i]["text"]
+
+    def define_set(name: str, prompts: Sequence[str]) -> dict:
+        """Name your own list of prompts (up to 256) so that tools taking dev
+        sets by name (a=, b=, sets=) can use it: for example the task prompts
+        the model gets wrong against the ones it gets right."""
+        if name in ctx.dev.sets() and name not in ctx.dev.custom:
+            raise ValueError(f"{name!r} is a set of this run; choose another name")
+        ctx.dev.custom[name] = [str(p) for p in prompts][:256]
+        return {"name": name, "n": len(ctx.dev.custom[name])}
+
+    def token_probs(prompts: Sequence[str], tokens: Sequence[str] = (), top: int = 5,
+                    answers: Sequence[str] | None = None) -> list[dict]:
+        """Next-token probabilities after each prompt (or after prompt plus the
+        start of an answer you give in `answers`): the probability of each of
+        `tokens`, and the `top` most likely tokens. No generation."""
+        runner = ctx.need_runner()
+        tok = runner.tokenizer
+        ids = [tok.encode(t, add_special_tokens=False)[0] for t in tokens]
+        if answers is None:
+            logits = runner.next_logits(list(prompts))
+        else:
+            with torch.no_grad():
+                runner._sync()
+                logits = torch.cat([runner.model(**runner._encode_texts([p], [a])).logits[:, -1, :].float().cpu()
+                                    for p, a in zip(prompts, answers)])
+        probs = torch.softmax(logits, dim=-1)
+        out = []
+        for row in probs:
+            best = row.topk(top)
+            out.append({"tokens": {t: round(float(row[i]), 5) for t, i in zip(tokens, ids)},
+                        "top": [(tok.convert_ids_to_tokens(int(i)), round(float(v), 4))
+                                for v, i in zip(best.values, best.indices)]})
+        return out
+
     def dev_prompts(name: str, n: int = 8) -> list[str]:
         """The first `n` prompts of a dev set, to read what the set contains."""
         return ctx.dev.get(name, n)
@@ -292,9 +498,15 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         return ctx.need_runner().generate(list(prompts), max_new_tokens)
 
     box.register("measure", dev_eval, cost=lambda n=32, sets=None, **_: {
-        "forward_passes": 1, "dev_prompts": n * len(sets if sets is not None else ctx.dev.sets())}, timed=True)
+        "forward_passes": 1, "dev_prompts": n * len(sets if sets is not None else ctx.dev.refusal_sets())}, timed=True)
     box.register("measure", dev_prompts)
-    n_sets = lambda sets: len(sets if sets is not None else ctx.dev.sets())  # noqa: E731
+    box.register("measure", define_set)
+    box.register("measure", answer)
+    box.register("measure", task_eval, cost=lambda name=None, n=64, offset=0, **_: {
+        "forward_passes": 1, "dev_prompts": n}, timed=True)
+    box.register("measure", token_probs, cost=lambda prompts=(), **_: {
+        "forward_passes": 1, "dev_prompts": max(len(prompts) // 8, 1)}, timed=True)
+    n_sets = lambda sets: len(sets if sets is not None else ctx.dev.refusal_sets())  # noqa: E731
     box.register("measure", refusal_margin, cost=lambda sets=None, n=64, **_: {
         "forward_passes": 1, "dev_prompts": n * n_sets(sets) // 8}, timed=True)  # no generation: an eighth the cost
     box.register("measure", steer, cost=lambda direction=None, layers=None, mode="ablate", scale=1.0, sets=None, n=32,

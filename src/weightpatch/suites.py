@@ -9,6 +9,7 @@ Kinds decide how an item is scored:
 - ``harm``        a harmful request; score 1 = the model gave a harmful answer
 - ``refusal``     a safe request that looks risky; score 1 = the model refused
 - ``capability``  a multiple-choice question; score 1 = correct
+- ``math``        a word problem with a numeric answer; score 1 = correct
 
 Each public source lists alternates, tried in order, because several safety
 sets are gated on the Hub. Sealed suites (the held-out pool) are read from
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -94,6 +96,36 @@ def _mcq(question: str, choices: Callable[[dict], Sequence[str]], answer: Callab
     return rows
 
 
+MATH_SUFFIX = "\n\nSolve it step by step. Put the final answer on the last line as: Answer: <number>"
+_NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def math_answer(text: str) -> str | None:
+    """The number a model gave: the first number after the last "Answer:", or
+    failing that the last number in the text. Commas and trailing zeros dropped."""
+    tail = text.rsplit("Answer:", 1)[1] if "Answer:" in text else None
+    found = _NUM.findall(tail) if tail is not None else []
+    pick = found[0] if found else (_NUM.findall(text) or [None])[-1]
+    if pick is None:
+        return None
+    pick = pick.replace(",", "")
+    try:
+        v = float(pick)
+    except ValueError:
+        return None
+    return str(int(v)) if v == int(v) else repr(round(v, 6))
+
+
+def math_correct(output: str, target: str | None) -> bool:
+    return target is not None and math_answer(output or "") == math_answer(str(target))
+
+
+def _gsm8k(ds):
+    for r in ds:
+        if "####" in r.get("answer", ""):
+            yield {"prompt": r["question"].strip() + MATH_SUFFIX, "target": r["answer"].rsplit("####", 1)[1].strip()}
+
+
 _HARMBENCH_CSV = ("https://raw.githubusercontent.com/centerforaisafety/HarmBench/main/data/"
                   "behavior_datasets/harmbench_behaviors_text_all.csv")
 _ADVBENCH_CSV = ("https://raw.githubusercontent.com/llm-attacks/llm-attacks/main/data/advbench/"
@@ -136,6 +168,8 @@ SOURCES: dict[str, tuple[str, int, list]] = {
         (_hf("sarvamai/mmlu-indic", "hi", "test"),
          _mcq("question", lambda r: r["choices"], lambda r: r["answer"])),
     ]),
+    "gsm8k_train": ("math", 256, [(_hf("openai/gsm8k", "main", "train"), _gsm8k)]),
+    "gsm8k_test": ("math", 256, [(_hf("openai/gsm8k", "main", "test"), _gsm8k)]),
     "medmcqa": ("capability", 4, [
         (_hf("openlifescienceai/medmcqa", None, "validation"),
          _mcq("question", lambda r: [r["opa"], r["opb"], r["opc"], r["opd"]], lambda r: r["cop"])),
@@ -301,4 +335,4 @@ def dynamic_suite(pool: Sequence[Item], n: int, round_seed: int,
     return Suite("dynamic", kind, items, 128)
 
 
-__all__ = ["Item", "Suite", "SOURCES", "load_public", "load_jsonl", "suite_from", "dynamic_suite", "mcq_prompt", "LETTERS"]
+__all__ = ["Item", "Suite", "SOURCES", "load_public", "load_jsonl", "suite_from", "math_answer", "math_correct", "dynamic_suite", "mcq_prompt", "LETTERS"]
