@@ -5,6 +5,7 @@
 approval_policy = "never"
 sandbox_mode = "read-only"
 web_search = "disabled"
+model_reasoning_summary = "detailed"  # reasoning summaries land in each turn's events.jsonl
 model_instructions_file = "__INSTRUCTIONS__"
 
 [agents]

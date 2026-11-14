@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -45,7 +46,7 @@ image = (
     )
     .pip_install(
         "torch>=2.10", "transformers>=5.15,<6", "safetensors", "numpy", "pyyaml", "datasets", "peft",
-        "accelerate", "hf_transfer", "sentencepiece", "protobuf",
+        "accelerate", "hf_transfer", "sentencepiece", "protobuf", "huggingface_hub",
         # Lexsi's stack, pinned to the versions this harness was verified against
         "safetune==0.1.12", "circuitkit==0.2.3", "auditkit==1.1.11",
     )
@@ -320,11 +321,191 @@ def episode(spec_yaml: str, name: str = "episode", model: str = "", effort: str 
                   "budget": snap["budget"], "edits": snap["edits"], "manifest": patch["manifest"],
                   "usage": [t.usage for t in result.turns]}
         (out / "report.json").write_text(json.dumps(report, indent=2, default=str))
+        try:  # the report agent; a failure here must not lose the run
+            from weightpatch.report import write_report
+
+            if (out / "worker" / "patch" / "patch.safetensors").exists():
+                _layer_record(out, spec["model"]["drifted"])
+            report["report"] = write_report(out, client, humanizer=Path("/app/skills/humanizer/SKILL.md").read_text())
+        except Exception as e:
+            print("report agent failed:", type(e).__name__, str(e)[:300], flush=True)
     finally:
         handle.close()
         _keep_login(client)
         runs.commit()
     return json.loads(json.dumps(report, default=str))
+
+
+# ------------------------------------------------------ report and publish
+CPU_KW = dict(memory=49152, timeout=3 * 3600, secrets=[hf], volumes={"/cache": cache, "/runs": runs, "/codex": codex})
+
+
+def _layer_record(run: Path, released: str) -> list:
+    """edits_by_layer.json: what the stored patch changes, per tensor and column."""
+    import torch
+    from safetensors.torch import load_file
+    from transformers import AutoModelForCausalLM
+
+    from weightpatch.report import layer_record
+
+    patch = load_file(str(run / "worker" / "patch" / "patch.safetensors"))
+    base = AutoModelForCausalLM.from_pretrained(released, dtype=torch.bfloat16)
+    rows = layer_record({n: p.detach() for n, p in base.named_parameters() if n in patch}, patch)
+    (run / "edits_by_layer.json").write_text(json.dumps(rows, indent=1))
+    return rows
+
+
+@app.function(**CPU_KW)
+def report(name: str, released: str = "CohereLabs/tiny-aya-global", model: str = "gpt-6-astra",
+           effort: str = "high") -> dict:
+    """The report agent on a finished run: records the edit per layer, then
+    Astra (tools off) writes REPORT.md from the evidence and a second pass
+    edits it with the humanizer skill."""
+    from weightpatch.model_client import CodexExecClient
+    from weightpatch.report import write_report
+
+    run = Path(f"/runs/{name}")
+    if (run / "worker" / "patch" / "patch.safetensors").exists():
+        rows = _layer_record(run, released)
+        print("LAYERS", [(r["layer"], r.get("columns_changed"), r["entries_changed"]) for r in rows], flush=True)
+    client = CodexExecClient(model=model, effort=effort, auth_file=f"{LOGIN_HOME}/auth.json")
+    try:
+        out = write_report(run, client, humanizer=Path("/app/skills/humanizer/SKILL.md").read_text())
+    finally:
+        _keep_login(client)
+        runs.commit()
+    print("REPORT", json.dumps({k: v for k, v in out.items() if k != "usage"}), flush=True)
+    return out
+
+
+MODEL_CARD = """\
+---
+license: cc-by-nc-4.0
+base_model: {released}
+library_name: transformers
+tags: [weightpatch, weight-editing, safetune, circuitkit, auditkit, lexsi]
+---
+# {title}
+
+`{released}` with {entries:,} weights changed ({fraction:.4%} of the model) in {tensors} tensors.
+The edit was made by an agent (GPT-6 Astra, its own tools off) working inside the WeightPatch
+harness with Lexsi Labs' SafeTune, CircuitKIT and AuditKIT, and was accepted by a grader that
+measures on prompts the agent never saw. No gradient training was used.
+
+Code: https://github.com/{github}. Full trace of the run: https://huggingface.co/datasets/{dataset}.
+
+## Files
+- `model.safetensors`, tokenizer and config: the edited model, loadable with `transformers`.
+- `weightpatch/patch.safetensors`: only the changed tensors. `weightpatch/manifest.json`: the edits and the
+  evidence the agent recorded for each. `weightpatch/edits_by_layer.json`: every changed column.
+- `weightpatch/REPORT.md`: the run report, also below.
+
+## Licence
+Tiny Aya is released by Cohere Labs under CC BY-NC 4.0; this derivative keeps that licence.
+
+---
+{report}
+"""
+
+
+@app.function(**CPU_KW)
+def publish(name: str, model_repo: str, dataset_repo: str, title: str, released: str = "CohereLabs/tiny-aya-global",
+            github: str = "perfect7613/weightpatch", extra_runs: str = "", collection: str = "WeightPatch",
+            private: bool = False) -> dict:
+    """Put a finished run on Hugging Face: the edited model (full weights plus
+    the patch), and a dataset with the run's trace, verdicts, atlas and report.
+    Both go into collections named ``collection``."""
+    import torch
+    from huggingface_hub import HfApi
+    from safetensors.torch import load_file
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    api, run = HfApi(token=os.environ["HF_TOKEN"]), Path(f"/runs/{name}")
+    owner = model_repo.split("/")[0]
+    manifest = json.loads((run / "worker" / "patch" / "manifest.json").read_text())
+    patch = load_file(str(run / "worker" / "patch" / "patch.safetensors"))
+    report_md = (run / "REPORT.md").read_text() if (run / "REPORT.md").exists() else ""
+
+    # ---- the model
+    model = AutoModelForCausalLM.from_pretrained(released, dtype=torch.bfloat16)
+    params = dict(model.named_parameters())
+    changed = 0
+    with torch.no_grad():
+        for n, t in patch.items():
+            changed += int((params[n] != t.to(params[n].dtype)).sum())
+            params[n].copy_(t.to(params[n].dtype))
+    if changed != manifest["entries_changed"]:
+        raise RuntimeError(f"patch changes {changed} entries, manifest says {manifest['entries_changed']}")
+    out = Path("/tmp/publish-model")
+    shutil.rmtree(out, ignore_errors=True)
+    model.save_pretrained(out, safe_serialization=True)
+    AutoTokenizer.from_pretrained(released).save_pretrained(out)
+    (out / "weightpatch").mkdir()
+    for f in (run / "worker" / "patch" / "patch.safetensors", run / "worker" / "patch" / "manifest.json",
+              run / "edits_by_layer.json", run / "REPORT.md", run / "worker" / "verdicts.jsonl"):
+        if f.exists():
+            shutil.copy2(f, out / "weightpatch" / f.name)
+    (out / "README.md").write_text(MODEL_CARD.format(
+        released=released, title=title, entries=changed, fraction=manifest["fraction_changed"], tensors=len(patch),
+        github=github, dataset=dataset_repo, report=report_md))
+    api.create_repo(model_repo, repo_type="model", private=private, exist_ok=True)
+    api.upload_folder(folder_path=str(out), repo_id=model_repo, repo_type="model",
+                      commit_message=f"WeightPatch run {name}")
+
+    # ---- the dataset: traces and logs of this run and any others named
+    stage = Path("/tmp/publish-data")
+    shutil.rmtree(stage, ignore_errors=True)
+    names = [name] + [x for x in extra_runs.split(",") if x]
+    for r in names:
+        src, dst = Path(f"/runs/{r}"), stage / "runs" / r
+        shutil.copytree(src, dst, ignore=shutil.ignore_patterns("circuitkit", "ckpt-*", "cache", "*.pt"))
+        for ev in dst.rglob("events.jsonl"):  # session ids of the model provider are not part of the record
+            ev.write_text(re.sub(r'"thread_id": "[^"]*"', '"thread_id": "redacted"', ev.read_text()))
+    for extra in ("profile/profile.json",):
+        if Path("/runs", extra).exists():
+            (stage / Path(extra).parent).mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path("/runs", extra), stage / extra)
+    shutil.copytree("/app/configs", stage / "configs")
+    shutil.copytree("/app/graders", stage / "graders")
+    hits = [str(p.relative_to(stage)) for p in stage.rglob("*") if p.is_file() and p.suffix != ".safetensors"
+            and re.search(r"hf_[A-Za-z0-9]{20}|refresh_token|access_token|@gmail\.com", p.read_text(errors="ignore"))]
+    if hits:
+        raise RuntimeError(f"refusing to publish: possible credentials or personal details in {hits[:5]}")
+    (stage / "README.md").write_text(
+        "---\nlicense: mit\ntags: [weightpatch, agent-traces, weight-editing, lexsi]\n---\n"
+        f"# WeightPatch runs: traces, logs and results\n\n"
+        f"Everything stored for the runs of the WeightPatch harness (https://github.com/{github}).\n\n"
+        "Per run, under `runs/<name>/`:\n"
+        "- `REPORT.md`: the run report, written by the report agent from `report_evidence.md`.\n"
+        "- `report.json`: outcome, grader verdicts, budget and token use.\n"
+        "- `edits_by_layer.json`: every changed tensor and column, with sizes.\n"
+        "- `trace/turns/tNNN/`: for each turn, the message sent to the agent (`prompt.txt`), its reply with its "
+        "explanation (`answer.md`), the code it ran (`code.py`), what the code printed (`output.txt`), the raw "
+        "model events (`events.jsonl`) and token use (`run.json`).\n"
+        "- `trace/notebook.md`, `trace/tool_calls.jsonl`: the agent's notes and every tool call with its cost.\n"
+        "- `worker/verdicts.jsonl`: each grader verdict in full. `worker/patch/`: the changed tensors and manifest.\n"
+        "- `worker/atlas/`: the model atlas the agent started from (architecture, wiring, diagram, profile, findings).\n\n"
+        "`configs/` and `graders/` are the episode and grader specs. `profile/profile.json` is the measured "
+        "baseline of the released model.\n\n"
+        f"Runs here: {', '.join(names)}. The edited model: https://huggingface.co/{model_repo}.\n\n"
+        "The traces quote prompts from public safety benchmarks (HarmBench, OR-Bench) and short model answers to "
+        "them. The grader's sealed prompts are not included.\n")
+    api.create_repo(dataset_repo, repo_type="dataset", private=private, exist_ok=True)
+    api.upload_folder(folder_path=str(stage), repo_id=dataset_repo, repo_type="dataset",
+                      commit_message=f"WeightPatch runs: {', '.join(names)}")
+
+    # ---- collections
+    links = {}
+    for kind, repo, label in (("model", model_repo, f"{collection}: models"), ("dataset", dataset_repo,
+                                                                              f"{collection}: datasets and traces")):
+        col = api.create_collection(title=label, namespace=owner, private=private, exists_ok=True,
+                                    description="WeightPatch, Lexsi Labs AI Safety and Alignment Hackathon")
+        api.add_collection_item(col.slug, item_id=repo, item_type=kind, exists_ok=True)
+        links[kind + "_collection"] = f"https://huggingface.co/collections/{col.slug}"
+    out_info = {"model": f"https://huggingface.co/{model_repo}", "dataset": f"https://huggingface.co/datasets/{dataset_repo}",
+                **links, "entries_changed": changed}
+    print("PUBLISHED", json.dumps(out_info), flush=True)
+    return out_info
 
 
 # ------------------------------------------------------- remote worker (kept)

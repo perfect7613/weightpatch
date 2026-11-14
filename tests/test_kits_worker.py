@@ -465,3 +465,40 @@ def test_margin_and_steering_tools_run_without_editing(tmp_path):
         assert not torch.allclose(w.runner.next_logits(["w1 w2 w3"]), plain)  # the intervention reaches the output
     assert torch.allclose(w.runner.next_logits(["w1 w2 w3"]), plain)
     assert len(w.runner._blocks()[1]._forward_hooks) == hooks  # and is removed afterwards
+
+
+def test_report_agent_writes_from_evidence_and_guards_numbers(tmp_path):
+    import json
+
+    import torch
+
+    from weightpatch.model_client import Reply
+    from weightpatch.report import evidence_pack, layer_record, write_report
+
+    base = {"model.layers.3.mlp.down_proj.weight": torch.randn(8, 16)}
+    new = {k: v.clone() for k, v in base.items()}
+    new["model.layers.3.mlp.down_proj.weight"][:, [2, 5]] *= 2
+    rows = layer_record(base, new)
+    assert rows[0]["layer"] == 3 and rows[0]["columns_changed"] == 2 and rows[0]["entries_changed"] == 16
+    run = tmp_path / "run"
+    (run / "trace" / "turns" / "t001").mkdir(parents=True)
+    (run / "trace" / "turns" / "t001" / "prompt.txt").write_text("# Task\nfix it\n# Tools\nhidden")
+    (run / "trace" / "turns" / "t001" / "answer.md").write_text("I will look.\n```python\nprint(1)\n```")
+    (run / "trace" / "turns" / "t001" / "output.txt").write_text("[ok]\nrate 0.315")
+    (run / "report.json").write_text(json.dumps({"turns": 1, "verdicts": [{"kind": "accepted"}], "usage": [{"input_tokens": 12}]}))
+    (run / "edits_by_layer.json").write_text(json.dumps(rows))
+    pack = evidence_pack(run)
+    assert "rate 0.315" in pack and "hidden" not in pack and "[code: see code.py]" in pack
+
+    class Fake:
+        def __init__(self, edited):
+            self.replies = ["# Report\nRefusals were 0.315 on " + "x " * 40, edited]
+
+        def send(self, message, new_conversation=False):
+            return Reply(self.replies.pop(0))
+
+    out = write_report(run, Fake("# Report\nRefusals: 0.315 on " + "x " * 40), humanizer="skill")
+    assert json.loads((run / "report_edit_check.json").read_text())["accepted"] and not out["numbers_not_in_evidence"]
+    write_report(run, Fake("# Report\nRefusals: 0.999 on " + "x " * 40), humanizer="skill")
+    assert not json.loads((run / "report_edit_check.json").read_text())["accepted"]  # an invented number is refused
+    assert "0.315" in (run / "REPORT.md").read_text()
