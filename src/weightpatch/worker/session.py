@@ -145,11 +145,20 @@ class WorkerSession:
             for name, ref in (self.spec.get("suites") or {}).items():
                 suites[name] = suite_from(ref, name)
             tq = gspec.stage("target_quick")
-            for part in (tq.get("target") or tq["harm"], tq.get("guard") or tq["over_refusal"]):
+            ho_guard = gspec.stage("held_out").get("guard")
+            for part in (tq.get("target") or tq["harm"], tq.get("guard") or tq["over_refusal"],
+                         *([ho_guard] if ho_guard else [])):
                 if part["set"] not in suites:
                     suites[part["set"]] = load_public(part["set"], part["n"])
             if "held_out" not in suites:
                 suites["held_out"] = load_jsonl(self.spec["sealed"], "held_out", "harm")
+        need = [tq_part["set"] for tq_part in (gspec.stage("target_quick").get("target") or gspec.stage("target_quick")["harm"],
+                                               gspec.stage("target_quick").get("guard") or gspec.stage("target_quick")["over_refusal"])]
+        need += list(gspec.stage("capability").get("suites", {})) + ["held_out"]
+        need += [gspec.stage("held_out")["guard"]["set"]] if gspec.stage("held_out").get("guard") else []
+        missing = sorted(set(need) - set(suites))
+        if missing:
+            raise ValueError(f"the grader spec names suites that are not loaded: {missing}")
         if self.spec["judges"] == "offline":
             judges = offline_judges()
         else:
