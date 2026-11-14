@@ -208,6 +208,9 @@ class WorkerSession:
             facts.append("Dev sets (visible to you; tools take them by name as a=, b= or sets=): " + "; ".join(
                 f"`{k}` ({len(v)} prompts" + (f", a good model should {want[k]}" if k in want else "") + ")"
                 for k, v in sets.items()) + ". tools.measure.dev_prompts(name) shows them.")
+        if self.spec.get("notes"):
+            facts.append("Notes from an earlier run on this same checkpoint (a lead to verify, not a result): "
+                         + " ".join(str(self.spec["notes"]).split()))
         for k, st in self.ctx.dev.tasks.items():
             facts.append(f"Task dev set `{k}`: {len(st.items)} {st.kind} items with right answers, up to "
                          f"{st.max_new_tokens} new tokens per answer. tools.measure.task_eval('{k}') scores the "
