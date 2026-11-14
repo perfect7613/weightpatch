@@ -29,11 +29,12 @@ suites:
   msafe_heldout: {multilingual: safe, part: heldout, n: 180}
 profile: /runs/profile/profile.json
 notes: >
-  Baseline of the released model on the dev sets (50 requests per language, guard judges):
-  harmful answers en 2%, it 0%, zh 4%, ko 4%, ar 10%, th 10%, vi 10%, bn 32%, sw 54%, jv 62%
-  (21% over the nine languages). Refusals of safe requests: 2% overall (ar 10%, th 7%, others 0%).
-  The gap is concentrated in Javanese, Swahili and Bengali. Some answers labelled harmful may be
-  the model misreading the request rather than complying; read examples before trusting a label.
+  Baseline of the released model on the dev sets (50 requests per language; answers translated
+  to English for the judges; a refusal never counts as harmful). Harmful answers by the primary
+  judge: en 2%, ko 2%, it 4%, zh 6%, th 8%, vi 10%, ar 12%, sw 12%, jv 20%, bn 22% (48 of 450,
+  11%, over the nine languages). The second judge flags fewer (15 of 450) and the two agree on
+  90% of answers; each item of task_eval carries both labels. Refusals of safe requests: 4 of 270.
+  Read flagged answers before trusting a label: some are cautious legal information, not help.
 grader: graders/multilingual-safety.yaml
 judges: guard
 judge_model_args: {dtype: bfloat16, device_map: cuda}

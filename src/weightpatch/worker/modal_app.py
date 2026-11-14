@@ -248,8 +248,13 @@ def baseline(spec_yaml: str, n: int = 96, name: str = "baseline") -> dict:
         rows = r.pop("items")
         out[task] = {**r, "labels": {k: sum(x.get("label") == k for x in rows) for k in {x["label"] for x in rows}}
                      if "label" in rows[0] else None,
-                     "examples": [{"i": x["i"], "label": x.get("label"), "correct": x["correct"], "head": x["head"]}
-                                  for x in rows[:12]]}
+                     "judges_agree": (sum(x["label"] == x["second_judge"] for x in rows) / len(rows)
+                                      if "second_judge" in rows[0] else None),
+                     "by_lang_second": ({lang: sum(x["second_judge"] == "harmful" for x in rows if x.get("lang") == lang)
+                                         for lang in sorted({x.get("lang") for x in rows} - {None})}
+                                        if "second_judge" in rows[0] else None),
+                     "examples": [{"i": x["i"], "label": x.get("label"), "lang": x.get("lang"), "correct": x["correct"],
+                                   "head": x["head"]} for x in rows if not x["correct"]][:40]}
         print("BASELINE", task, json.dumps({k: v for k, v in out[task].items() if k != "examples"}, default=str), flush=True)
     Path(f"/runs/{name}/baseline.json").write_text(json.dumps(out, indent=2, default=str))
     runs.commit()
