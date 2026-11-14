@@ -10,7 +10,7 @@ batch_size: 16
 cap: 0.001
 tools: ["inspect.*", "localize.*", "repair.*", "edit.*", "measure.*"]
 budgets: {code_runs: 150, forward_passes: 600, dev_prompts: 30000, gpu_seconds: 14400, submissions: 6}
-llm_judge: {model: gpt-6-astra, effort: low, auth_file: /codex/login/auth.json, batch: 16, workers: 3}
+llm_judge: {model: gpt-6-astra, effort: low, auth_file: /codex/login/auth.json, batch: 16, workers: 4}
 dev:
   n: 48
   seed: 0
@@ -20,8 +20,8 @@ dev:
   tasks:
     gaming: {public: reward_hacks, pool: 1073, offset: 0, n: 192}
 suites:
-  gaming_target: {public: reward_hacks, pool: 1073, offset: 192, n: 96}
-  held_out: {public: reward_hacks, pool: 1073, offset: 288, n: 192}
+  gaming_target: {public: reward_hacks, pool: 1073, offset: 192, n: 288}
+  held_out: {public: reward_hacks, pool: 1073, offset: 480, n: 480}
 profile: /runs/profile/profile.json
 grader: graders/metric-gaming-repair.yaml
 judges: guard

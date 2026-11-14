@@ -60,6 +60,7 @@ against. Every call into them was checked against their source and exercised in 
 | `drift` | Three tiers of damage to repair (below). |
 | `graft` | GRAFT gradient routing on one GPU, and merging its adapters into a plain checkpoint. |
 | `worker` | The half that sits next to the weights, and the provider adapters that reach it: local, Modal (L40S), HTTP to any GPU machine. |
+| `report` | The report agent: after a run, Astra (tools off) writes the report from an evidence pack built by code, a second pass edits the prose with the humanizer skill, and any number that is not in the evidence is flagged. Also records every changed column per layer. |
 | `toy` | A planted-drift model with an exact answer key, for end-to-end runs on a laptop. |
 
 Not built yet: the web app (Sign in with ChatGPT, connect a GPU provider, ask for a repair), the
@@ -67,7 +68,7 @@ LLM cheat reviewer, the goal router for prompts beyond safety drift, and the exp
 
 ### What has and has not been run
 
-- All 67 tests pass on CPU. They run the real kits on a tiny random Cohere2 model: all six
+- All 72 tests pass on CPU. They run the real kits on a tiny random Cohere2 model: all six
   SafeTune recover methods, the SafeTune localizers, CircuitKIT discovery and faithfulness,
   AuditKIT evaluation and significance, GRAFT training and merging, the three drift tiers, and
   the worker over the local and HTTP providers.
@@ -111,6 +112,20 @@ harm checks would catch a rise of more than 5 points, not a smaller one. An earl
 smaller measurement budget and no steering tool was rejected by the grader (-2.5 points, not
 significant), so the result depends on the tools the agent has.
 
+The edited model, with the patch and the run report: https://huggingface.co/Perfect7613/tiny-aya-global-weightpatch-overrefusal.
+Every turn of the run (the message to the agent, its explanation, its code, the output, token
+use), the grader verdicts and the atlas: https://huggingface.co/datasets/Perfect7613/weightpatch-runs.
+
+### Math word problems: no gain, reported as such
+
+Goal: raise GSM8K accuracy (`configs/episodes/tiny-aya-math.yaml`). The released model scores
+76.6% on 256 dev problems. Astra read the failures first: of 27 wrong answers in the first 128,
+6 ran out of tokens and 21 were finished but wrong, mostly reasoning or arithmetic slips. It
+followed two leads (a layer-33 neuron that pushes LaTeX formatting, a layer-34 neuron tied to
+long introductions); scaling either fixed about as many answers as it broke. It reverted both
+and did not submit. A small weight edit can remove a habit that wastes answers; it did not find
+one here, and it cannot add reasoning. The trace and report are in the dataset above.
+
 ### Drift repair on Tiny Aya (validation with a known answer; one run, quick grader)
 
 Drift tier D1: SafeTune's abliteration attack on `tiny-aya-global` changed 72 tensors (22.7% of
@@ -133,6 +148,21 @@ What this does and does not show: it is one run, on the easiest tier, graded wit
 (60 to 100 items per suite, so intervals are wide), and the edit uses the aligned checkpoint as
 a reference. It is much weaker than the oracle on perturbed prompts. D2, D3, the full grader,
 repeated runs and the no-kit ablation have not been run.
+
+## What the agent can do, beyond the kits
+
+Several of these come from Beaker's write-up on weight-space programming
+(withbeaker.ai/blog/weight-space-programming) and from what failed in our own runs.
+
+| Tool | What it gives the agent |
+|---|---|
+| `measure.task_eval` | Per-answer feedback on a task set: right or wrong, the answer given, length, whether it ran out of tokens or looped, and a paired comparison with the released model (fixed, broke, interval). The noise gate: an edit is kept only when the interval excludes zero. |
+| `measure.sweep` | Scores many single-neuron trials one at a time and keeps none, so candidates are judged independently. |
+| `measure.steer` | Changes activations along a direction while the model runs, with no edit, and measures refusals or a task. A hypothesis is tested before it becomes a weight change. |
+| `measure.refusal_margin`, `measure.preference`, `measure.token_probs` | Continuous, generation-free measures for comparing small edits. |
+| `localize.token_writers` | Which MLP neurons push given output tokens, read from weights alone (the output head reuses the embedding table). No forward pass. |
+| `localize.neuron_contrast`, `localize.neuron_trace` | Neurons that differ between two groups of prompts or answers, and a neuron's activation at every token of an answer. A column edit acts wherever the neuron fires, so this is checked before editing. |
+| `measure.submit` | The grader. A final answer that comes with most of the budget unused is sent back with a request to change approach. |
 
 ## Drift tiers
 
