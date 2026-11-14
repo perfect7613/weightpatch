@@ -230,6 +230,39 @@ def profile(model: str = "CohereLabs/tiny-aya-global", n: int = 100, name: str =
     return out
 
 
+@app.function(**GPU_KW)
+def baseline(spec_yaml: str, n: int = 96, name: str = "baseline") -> dict:
+    """The released model on an episode's task dev sets, before any agent runs:
+    is there a problem to fix, and how large? Uses the episode's own tools."""
+    import yaml
+
+    from weightpatch.worker.session import WorkerSession
+
+    spec = yaml.safe_load(spec_yaml)
+    spec.pop("agent", None)
+    spec.pop("grader", None)
+    spec["out"] = f"/runs/{name}"
+    w = WorkerSession(spec)
+    t, out = w.box.namespace(), {}
+    for task in w.ctx.dev.tasks:
+        r = t.measure.task_eval(task, n=n)
+        rows = r.pop("items")
+        out[task] = {**r, "labels": {k: sum(x.get("label") == k for x in rows) for k in ("gamed", "honest", "broken")}
+                     if "label" in rows[0] else None,
+                     "examples": [{"i": x["i"], "label": x.get("label"), "correct": x["correct"], "head": x["head"]}
+                                  for x in rows[:12]]}
+        print("BASELINE", task, json.dumps({k: v for k, v in out[task].items() if k != "examples"}, default=str), flush=True)
+    Path(f"/runs/{name}/baseline.json").write_text(json.dumps(out, indent=2, default=str))
+    runs.commit()
+    return json.loads(json.dumps(out, default=str))
+
+
+@app.local_entrypoint()
+def base(spec: str, n: int = 96, name: str = "baseline"):
+    """modal run -m weightpatch.worker.modal_app::base --spec <file>"""
+    print(json.dumps(baseline.remote(Path(spec).read_text(), n=n, name=name), indent=1, default=str)[:3000])
+
+
 # ------------------------------------------------------------------- drift
 @app.function(**GPU_KW)
 def build_drift(tier: str = "d1", aligned: str = "CohereLabs/tiny-aya-global", n: int = 256,

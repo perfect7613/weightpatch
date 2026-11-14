@@ -532,7 +532,8 @@ def _register_circuitkit(box: ToolBox, kit: KitContext) -> None:
             data = torch.load(scores_file, weights_only=False)
             order, ns = list(data["node_scores"]), data["neurons_scores"].float().cpu()
             mlp, heads = {}, {}
-            for name in sorted(order, key=lambda k: -abs(data["node_scores"][k]))[:16]:
+            ranked = sorted(order, key=lambda k: -abs(data["node_scores"][k]))
+            for name in [k for k in ranked if _CK_MLP.match(k)][:8] + [k for k in ranked if _CK_HEAD.match(k)][:8]:
                 row = ns[1 + order.index(name)]
                 best = row.abs().topk(min(12, row.numel())).indices
                 dims = [[int(i), round(float(row[i]), 6)] for i in best]
