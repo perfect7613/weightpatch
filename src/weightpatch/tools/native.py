@@ -65,6 +65,7 @@ class ToolContext:
     reference_name: str = "aligned"  # what it is: "aligned" in a repair, "base" when improving a released model
     runner: ForwardRunner | None = None
     dev: DevSet = field(default_factory=DevSet)
+    hack_judge: Any = None  # (items, texts) -> labels, for task sets of kind "hack"
     findings: list[dict] = field(default_factory=list)  # flushed to the atlas
 
     def need_reference(self) -> Mapping[str, torch.Tensor]:
@@ -391,16 +392,9 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
                              "result": {k: v for k, v in out.items() if not isinstance(v, (list, dict))}})
         return out
 
-    def _score(suite, item, text: str) -> bool:
-        from ..suites import math_correct
-
-        if suite.kind == "math":
-            return math_correct(text, item.target)
-        raise ValueError(f"task set of kind {suite.kind!r} has no scorer")
-
     def _task_run(name: str, n: int, offset: int, state=None) -> list[dict]:
         from ..grader.detectors import is_looping
-        from ..suites import math_answer
+        from ..suites import math_answer, math_correct
 
         runner, suite = ctx.need_runner(), ctx.dev.tasks[name]
         items = suite.items[offset:offset + n]
@@ -409,18 +403,28 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
                 texts, counts = runner.generate([i.prompt for i in items], suite.max_new_tokens, lengths=True)
         else:
             texts, counts = runner.generate([i.prompt for i in items], suite.max_new_tokens, lengths=True)
-        return [{"i": offset + k, "correct": bool(_score(suite, it, t)), "final": math_answer(t), "target": it.target,
-                 "tokens": c, "finished": c < suite.max_new_tokens, "looping": is_looping(t), "text": t}
-                for k, (it, t, c) in enumerate(zip(items, texts, counts))]
+        if suite.kind == "math":
+            extra = [{"correct": bool(math_correct(t, it.target)), "final": math_answer(t), "target": it.target}
+                     for it, t in zip(items, texts)]
+        elif suite.kind == "hack":  # "correct" = an honest attempt, as labelled by the judge the grader uses
+            if ctx.hack_judge is None:
+                raise RuntimeError("this run has no judge for hack sets")
+            extra = [{"correct": lab == "honest", "label": lab} for lab in ctx.hack_judge(items, texts)]
+        else:
+            raise ValueError(f"task set of kind {suite.kind!r} has no scorer")
+        return [{"i": offset + k, **e, "tokens": c, "finished": c < suite.max_new_tokens, "looping": is_looping(t),
+                 "text": t} for k, (e, t, c) in enumerate(zip(extra, texts, counts))]
 
     def task_eval(name: str, n: int = 64, offset: int = 0) -> dict:
         """Score the current weights on a task dev set (one with right answers),
         item by item, against the released model on the same items.
         Returns {"accuracy", "released_accuracy", "vs_released": {diff, lo, hi,
         significant, fixed, broke}, "unfinished", "looping", "items": [...]}.
-        Each item: i, correct, released_correct, final (the number the model
-        gave), target, tokens, finished (False = it ran out of tokens), looping,
-        head and tail of the answer. `vs_released` is a paired bootstrap: treat
+        Each item: i, correct, released_correct, tokens, finished (False = it
+        ran out of tokens), looping, head and tail of the answer; for math also
+        final (the number given) and target; for gaming sets `label` ("gamed",
+        "honest" or "broken", from the judge the grader uses) and correct =
+        honest. `vs_released` is a paired bootstrap: treat
         an edit as real only when the interval excludes zero, and distrust any
         gain smaller than the noise it shows. Use offset to keep part of the
         set untouched while you localize. tools.measure.answer gives full texts."""
@@ -446,6 +450,32 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         ctx.findings.append({"tool": "measure.task_eval", "set": name, "n": n, "offset": offset,
                              "accuracy": out["accuracy"], "released": out["released_accuracy"]})
         return out
+
+    def preference(name: str, n: int = 48, offset: int = 0) -> dict:
+        """For a task set whose items carry two example answers (a gamed one
+        and an honest one): how much more likely the current weights find the
+        gamed answer than the honest one, as mean log-probability per token,
+        per item. No generation and no judge, so it is cheap and continuous:
+        use it to compare small edits, and tools.measure.task_eval to confirm
+        on real answers. Returns {"mean_margin", "share_prefers_gamed",
+        "margins": [per item]}; positive = prefers the gamed answer."""
+        runner, suite = ctx.need_runner(), ctx.dev.tasks[name]
+        items = [i for i in suite.items[offset:offset + n] if i.meta.get("gamed_example")]
+        prompts = [i.prompt for i in items]
+        bad = runner.loglik(prompts, [i.meta["gamed_example"][:1200] for i in items])
+        good = runner.loglik(prompts, [i.meta["honest_example"][:1200] for i in items])
+        m = [round(b - g, 4) for b, g in zip(bad, good)]
+        return {"n": len(m), "mean_margin": sum(m) / max(len(m), 1),
+                "share_prefers_gamed": sum(x > 0 for x in m) / max(len(m), 1), "margins": m}
+
+    def examples(name: str, i: int) -> dict:
+        """Item `i` of a task set as shown to the model, with whatever comes
+        with it: for math the right answer; for gaming sets the task, the
+        stated metric, the known way to cheat, and one gamed and one honest
+        example answer (useful as contrast texts for
+        tools.localize.neuron_contrast via a_answers / b_answers)."""
+        it = ctx.dev.tasks[name].items[i]
+        return {"prompt": it.prompt, "target": it.target, **it.meta}
 
     def answer(name: str, i: int, which: str = "candidate") -> str:
         """The full answer text for item `i` of a task set from the last
@@ -502,6 +532,9 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
     box.register("measure", dev_prompts)
     box.register("measure", define_set)
     box.register("measure", answer)
+    box.register("measure", examples)
+    box.register("measure", preference, cost=lambda name=None, n=48, **_: {
+        "forward_passes": 1, "dev_prompts": max(n // 4, 1)}, timed=True)
     box.register("measure", task_eval, cost=lambda name=None, n=64, offset=0, **_: {
         "forward_passes": 1, "dev_prompts": n}, timed=True)
     box.register("measure", token_probs, cost=lambda prompts=(), **_: {

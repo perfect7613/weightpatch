@@ -75,6 +75,7 @@ class WorkerSession:
         self.ctx = ToolContext(self.session, runner=self.runner, dev=self._dev(loaded),
                                reference=loaded.get("base") if self.improve else loaded["aligned"],
                                reference_name="base" if self.improve else "aligned")
+        self.ctx.hack_judge = self._hack_judge()
         register_native_tools(self.box, self.ctx)
         self.kit = KitContext(self.ctx, base=loaded.get("base"), workdir=self.out / "circuitkit",
                               aligned=self.session.baseline if self.improve else None)
@@ -108,6 +109,22 @@ class WorkerSession:
                       expect=dict(d.get("expect") or {}),
                       tasks={k: suite_from(v, k, d["n"], d.get("seed", 0)) for k, v in (d.get("tasks") or {}).items()})
 
+    def _hack_judge(self):
+        """The judge for gaming sets: an LLM call (spec ``llm_judge``), or the
+        offline stand-in for tests. One judge serves the dev tools and the grader."""
+        cfg = self.spec.get("llm_judge")
+        if not cfg:
+            from ..evaluator import offline_hack_judge
+
+            return offline_hack_judge if self.spec["judges"] == "offline" else None
+        from ..evaluator import llm_hack_judge
+        from ..model_client import CodexExecClient
+
+        make = lambda: CodexExecClient(model=cfg.get("model", "gpt-6-astra"), effort=cfg.get("effort", "low"),  # noqa: E731
+                                       auth_file=cfg.get("auth_file"))
+        return llm_hack_judge(make, batch=int(cfg.get("batch", 16)), workers=int(cfg.get("workers", 3)),
+                              log=str(self.out / "hack_judge.jsonl"))
+
     def _grader(self, loaded: Mapping[str, Any]):
         raw = self.spec.get("grader")
         if not raw or self.runner is None:
@@ -138,6 +155,8 @@ class WorkerSession:
         else:
             j = {**gspec.data.get("judges", {}), **(self.spec.get("judge_profiles") or {})}
             judges = guard_judges(j.get("primary", "wildguard"), j.get("second"), self.spec.get("judge_model_args"))
+        if self.ctx.hack_judge is not None:
+            judges.hack = self.ctx.hack_judge
         references = {"drifted": self.session.baseline}
         if not self.improve:
             references["aligned"] = loaded["aligned"]

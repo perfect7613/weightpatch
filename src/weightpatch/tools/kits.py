@@ -492,8 +492,14 @@ def _register_circuitkit(box: ToolBox, kit: KitContext) -> None:
     def discover_circuit(task: str = "dev", algorithm: str = "eap-ig", level: str = "node",
                          n_examples: int = 64, sparsity: float = 0.3, scope: str = "both",
                          on: str = "candidate", a: str = "harmful", b: str = "benign") -> dict:
-        """CircuitKIT circuit discovery: which attention heads and MLPs, or with
-        level="neuron" which neurons, carry the refuse-versus-comply behaviour.
+        """CircuitKIT circuit discovery: which attention heads and MLPs carry
+        the difference between dev sets `a` and `b` (default: refuse versus
+        comply). level="neuron" goes one step finer: for each head and MLP, which
+        coordinates of its OUTPUT in the residual stream matter. Those are rows
+        of `mlp.down_proj.weight` / `self_attn.o_proj.weight`, not MLP hidden
+        neurons (hidden neurons are columns; SafeTune's safety_neurons and
+        tools.localize.neuron_contrast rank those). The result then also has
+        "mlp_out_dims" {layer: [[dim, score], ...]} and "head_out_dims".
         task="dev" uses this episode's harmful and benign dev prompts; harmbench,
         advbench, jailbreakbench and sorrybench use those public sets.
         `on` is "candidate", "aligned" or "base". Returns {circuit, top_nodes
@@ -519,7 +525,24 @@ def _register_circuitkit(box: ToolBox, kit: KitContext) -> None:
         top = {k: float(v) for k, v in circuit.top_nodes(24).items()}
         ctx.findings.append({"tool": "localize.discover_circuit", "task": task, "algorithm": algorithm,
                              "level": level, "on": on, "circuit": handle, "top": top})
-        return {"circuit": handle, "top_nodes": top, "n_nodes": len(circuit), "units": units_of(info)}
+        out = {"circuit": handle, "top_nodes": top, "n_nodes": len(circuit), "units": units_of(info)}
+        scores_file = out_path.with_name(out_path.stem + "_scores.pt")
+        if level == "neuron" and scores_file.exists():
+            # one row per component, in node order after the input node; one column per residual coordinate
+            data = torch.load(scores_file, weights_only=False)
+            order, ns = list(data["node_scores"]), data["neurons_scores"].float().cpu()
+            mlp, heads = {}, {}
+            for name in sorted(order, key=lambda k: -abs(data["node_scores"][k]))[:16]:
+                row = ns[1 + order.index(name)]
+                best = row.abs().topk(min(12, row.numel())).indices
+                dims = [[int(i), round(float(row[i]), 6)] for i in best]
+                if m := _CK_MLP.match(name):
+                    mlp[int(m.group(1))] = dims
+                elif m := _CK_HEAD.match(name):
+                    heads[f"A{m.group(1)}.{m.group(2)}"] = dims
+            out.update(mlp_out_dims=mlp, head_out_dims=heads)
+            kit.circuits[handle]["level"] = "neuron"
+        return out
 
     def circuit_faithfulness(circuit: str, n_examples: int = 64, on: str = "candidate") -> dict:
         """CircuitKIT faithfulness of a discovered circuit: patching_score and
@@ -531,6 +554,9 @@ def _register_circuitkit(box: ToolBox, kit: KitContext) -> None:
         entry = kit.circuits.get(circuit)
         if entry is None or "ck" not in entry:
             raise KeyError(f"{circuit!r} was not produced by localize.discover_circuit")
+        if entry.get("level") == "neuron":
+            raise ValueError("CircuitKIT scores faithfulness for node-level circuits; run "
+                             "localize.discover_circuit(level='node') on the same sets and check that one")
         with contextlib.chdir(_workdir()):
             report = ck.faithfulness(_hooked(on), entry["ck"], entry["task"], n_examples=n_examples)
         out = {"patching_score": float(report.patching_score), "ablation_score": float(report.ablation_score)}

@@ -161,6 +161,22 @@ class HFRunner:
             chunks.append(self.model(**enc).logits[:, -1, :].float().cpu())
         return torch.cat(chunks, dim=0)
 
+    @torch.no_grad()
+    def loglik(self, prompts: Sequence[str], answers: Sequence[str]) -> list[float]:
+        """Mean log-probability per token of each answer given its prompt."""
+        self._sync()
+        out = []
+        for p, a in zip(prompts, answers):
+            n_prompt = self._encode([p])["input_ids"].shape[1]
+            enc = self._encode_texts([p], [a])
+            ids = enc["input_ids"][0]
+            if ids.shape[0] <= n_prompt:
+                out.append(float("nan"))
+                continue
+            logp = torch.log_softmax(self.model(**enc).logits[0, n_prompt - 1:-1].float(), dim=-1)
+            out.append(float(logp.gather(1, ids[n_prompt:].unsqueeze(1)).mean()))
+        return out
+
     def _blocks(self):
         body = getattr(self.model, self.model.base_model_prefix, self.model)
         return body.layers

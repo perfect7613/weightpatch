@@ -16,7 +16,9 @@ only where two of them agree. Every localizer takes two dev sets, `a` and `b`, b
 - SafeTune `tools.localize.safety_direction(a=..., b=...)`: the best single direction and its layer.
 - SafeTune `tools.localize.eap_circuit(a=..., b=...)` and CircuitKIT
   `tools.localize.discover_circuit(a=..., b=...)`: attention heads and MLPs on the path. Check
-  `tools.localize.circuit_faithfulness` first; a low score means the circuit is not the mechanism.
+  `tools.localize.circuit_faithfulness` first (node level); a low score means the circuit is not
+  the mechanism. `discover_circuit(level="neuron")` adds, per head and MLP, the output coordinates
+  that matter (rows of down_proj / o_proj), which narrows an edit of a column to a few rows.
 - Then edit the agreed units directly (see the direct-edit notes), or pass a circuit handle to
   `tools.repair.ctheta(circuit=...)` to move only that circuit.
 Quote the tool result that named each unit in the edit's `evidence=`.

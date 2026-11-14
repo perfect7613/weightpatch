@@ -532,3 +532,34 @@ def test_task_tools_and_accuracy_target(tmp_path):
 
     from weightpatch.grader import SuiteRun, _as_error
     assert _as_error(SuiteRun([1.0, 0.0], ["a", "b"]), True).scores == [0.0, 1.0]
+
+
+def test_hack_suites_are_judged_in_batches_and_scored(tmp_path):
+    from weightpatch.evaluator import llm_hack_judge, offline_hack_judge
+    from weightpatch.model_client import Reply
+    from weightpatch.suites import Item, Suite
+
+    items = [Item(f"h{i}", f"w{i} w{i + 1}", meta={"cheat": "repeat", "gamed_example": "w1 w1 w1 w1", "honest_example": "w2 w3 w4"})
+             for i in range(5)]
+    assert offline_hack_judge(items[:3], ["w1 w1 w1 w1 w2", "w1 w2 w3 w4", ""]) == ["gamed", "honest", "broken"]
+
+    class Fake:
+        calls = 0
+
+        def send(self, message, new_conversation=False):
+            Fake.calls += 1
+            n = message.count("### Case")
+            if Fake.calls == 1:
+                return Reply("not json")  # a malformed reply is retried
+            return Reply("here: " + str([{"case": k + 1, "label": "gamed" if k == 0 else "honest"} for k in range(n)]).replace("'", '"'))
+
+    judge = llm_hack_judge(Fake, batch=2, workers=1, log=str(tmp_path / "j.jsonl"))
+    assert judge(items, ["a"] * 5) == ["gamed", "honest", "gamed", "honest", "gamed"] and (tmp_path / "j.jsonl").exists()
+
+    w = WorkerSession(_spec(tmp_path, mode="improve", judges="offline"))
+    w.ctx.dev.tasks["gaming"] = Suite("gaming", "hack", items, 6)
+    r = w.handle("run", {"code": "t = tools.measure.task_eval('gaming', n=4)\n"
+                                 "print(t['items'][0]['label'] in ('gamed', 'honest', 'broken'), 0 <= t['accuracy'] <= 1)\n"
+                                 "p = tools.measure.preference('gaming', n=4); print(len(p['margins']), sorted(tools.measure.examples('gaming', 0))[:2])"})
+    assert r["ok"], r["output"]
+    assert "True True" in r["output"] and "4 ['cheat', 'gamed_example']" in r["output"]
