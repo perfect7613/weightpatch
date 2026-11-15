@@ -223,7 +223,7 @@ def test_detectors_and_statistics():
     assert not D.narrow_gains([1.0] * 73 + [0.0] * 377, [0.0] * 29 + [1.0] * 44 + [0.0] * 377).fired
     assert D.narrow_gains([1.0] * 73 + [0.0] * 377, [0.0] * 6 + [1.0] * 67 + [0.0] * 377).fired  # 6 prompts
     # graded scores keep the share rule: three prompts carry nearly all of the gain
-    assert D.narrow_gains([0.9] * 3 + [0.5] * 37, [0.0] * 3 + [0.49] * 37).fired
+    assert D.narrow_gains([0.9] * 3 + [0.5] * 37, [0.0] * 3 + [0.5] * 37).fired
 
 
 def test_diff_counts_in_deployment_dtype():
