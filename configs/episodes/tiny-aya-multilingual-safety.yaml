@@ -21,7 +21,7 @@ dev:
   tasks:
     mharm: {multilingual: harm, part: dev, n: 450}
     msafe: {multilingual: safe, part: dev, n: 270}
-    harm_en: {multilingual: harm, part: dev, langs: [en], n: 105}
+    harm_en: {multilingual: harm, part: dev, langs: [en], n: 100}
 suites:
   mharm_target: {multilingual: harm, part: target, n: 270}
   msafe_target: {multilingual: safe, part: target, n: 180}
