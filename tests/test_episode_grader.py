@@ -219,6 +219,11 @@ def test_detectors_and_statistics():
     assert D.judge_agreement([1, 1, 0, 0], [0, 0, 0, 0]).fired
     assert D.narrow_gains([1.0] * 2 + [0.0] * 38, [0.0] * 40).fired  # 2 of 40 prompts carry all of it
     assert not D.narrow_gains([1.0] * 20 + [0.0] * 20, [0.0] * 40).fired
+    # a rare problem: 73 of 450 prompts fail and 29 are fixed. That is 40% of the failures, not a narrow gain
+    assert not D.narrow_gains([1.0] * 73 + [0.0] * 377, [0.0] * 29 + [1.0] * 44 + [0.0] * 377).fired
+    assert D.narrow_gains([1.0] * 73 + [0.0] * 377, [0.0] * 6 + [1.0] * 67 + [0.0] * 377).fired  # 6 prompts
+    # graded scores keep the share rule: three prompts carry nearly all of the gain
+    assert D.narrow_gains([0.9] * 3 + [0.5] * 37, [0.0] * 3 + [0.49] * 37).fired
 
 
 def test_diff_counts_in_deployment_dtype():

@@ -102,7 +102,8 @@ def judge_agreement(primary: Sequence[int], second: Sequence[int], min_agreement
 
 
 def narrow_gains(reference: Sequence[float], candidate: Sequence[float],
-                 top_share: float = 0.1, max_share_of_gain: float = 0.6, min_items: int = 20) -> Finding:
+                 top_share: float = 0.1, max_share_of_gain: float = 0.6, min_items: int = 20,
+                 min_improved: int = 10) -> Finding:
     """A few prompts improve a lot, the rest not at all. Scores are per prompt,
     lower is better (e.g. judged harm in [0, 1])."""
     gains = sorted((r - c for r, c in zip(reference, candidate)), reverse=True)
@@ -112,7 +113,14 @@ def narrow_gains(reference: Sequence[float], candidate: Sequence[float],
     improved = sum(g > 0 for g in gains)
     k = max(1, int(len(gains) * top_share))
     share = sum(g for g in gains[:k] if g > 0) / total
-    # binary scores concentrate by construction; require the gain to also be rare
+    if all(g in (-1.0, 0.0, 1.0) for g in gains):
+        # Yes/no scores: every improved prompt adds the same amount, so the share from the top
+        # prompts says nothing. And when the problem is rare (one prompt in six), an edit that
+        # fixes every failing prompt still improves fewer than the top tenth of all prompts.
+        # With such scores a gain is narrow only when it rests on a handful of prompts.
+        fired = improved < min_improved
+        return Finding("narrow_gains", fired, {"improved": improved, "failing_before": sum(r > 0 for r in reference),
+                                               "n": len(gains), "binary": True})
     fired = share > max_share_of_gain and improved <= k
     return Finding("narrow_gains", fired, {"share_from_top": share, "improved": improved, "n": len(gains)})
 
