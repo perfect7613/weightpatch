@@ -66,6 +66,8 @@ class ToolContext:
     runner: ForwardRunner | None = None
     dev: DevSet = field(default_factory=DevSet)
     hack_judge: Any = None  # (items, texts) -> labels, for task sets of kind "hack"
+    translate: Any = None  # (texts, langs) -> English, when the run has a translator
+    withhold_harmful: bool = False  # do not hand answers judged harmful (or unjudged answers to harmful prompts) to the agent
     score_texts: Any = None  # (suite, items, texts) -> (scores, second): the grader's own scoring, 1.0 = unwanted
     findings: list[dict] = field(default_factory=list)  # flushed to the atlas
 
@@ -338,7 +340,26 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
                 _cache["refusal"] = _auditkit_refusal()
             except Exception:
                 _cache["refusal"] = lambda p, o: looks_like_refusal(o)
-        return [bool(_cache["refusal"](p, t)) for p, t in zip(prompts, texts)]
+        out = [bool(_cache["refusal"](p, t)) for p, t in zip(prompts, texts)]
+        # answers to prompts of a multilingual set are also read in English translation
+        langs = [_lang_of(p) for p in prompts]
+        todo = [k for k, (lang, r) in enumerate(zip(langs, out)) if lang not in (None, "en") and not r and texts[k].strip()]
+        if todo and ctx.translate is not None:
+            english = ctx.translate([texts[k].strip()[:600] for k in todo], [langs[k] for k in todo])
+            for k, e in zip(todo, english):
+                out[k] = bool(_cache["refusal"](prompts[k], e))
+        return out
+
+    def _lang_of(prompt: str) -> str | None:
+        if "langs" not in _cache:
+            _cache["langs"] = {it.prompt: it.meta.get("lang") for st in ctx.dev.tasks.values() for it in st.items
+                               if it.meta.get("lang")}
+        return _cache["langs"].get(prompt)
+
+    WITHHELD = "[withheld: judged harmful; the text is not shown in this run]"
+
+    def _show(row: Mapping[str, Any]) -> bool:
+        return not (ctx.withhold_harmful and row.get("label") == "harmful")
 
     def _rates(sets, n, max_new_tokens, per_prompt=False) -> dict:
         runner, out = ctx.need_runner(), {}
@@ -449,7 +470,8 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
                "unfinished": sum(not r["finished"] for r in cand), "looping": sum(r["looping"] for r in cand),
                "released_unfinished": sum(not r["finished"] for r in base),
                "items": [{**{k: v for k, v in r.items() if k != "text"}, "released_correct": rb["correct"],
-                          "head": r["text"][:80], "tail": r["text"][-120:]} for r, rb in zip(cand, base)]}
+                          "head": r["text"][:80] if _show(r) else WITHHELD,
+                          "tail": r["text"][-120:] if _show(r) else ""} for r, rb in zip(cand, base)]}
         ctx.findings.append({"tool": "measure.task_eval", "set": name, "n": n, "offset": offset,
                              "accuracy": out["accuracy"], "released": out["released_accuracy"]})
         return out
@@ -551,7 +573,7 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
         rows = _cache.get(("candidate", name) if which == "candidate" else ("released_rows", name), {})
         if i not in rows:
             raise KeyError(f"item {i} of {name!r} has not been run; call tools.measure.task_eval first")
-        return rows[i]["text"]
+        return rows[i]["text"] if _show(rows[i]) else WITHHELD
 
     def define_set(name: str, prompts: Sequence[str]) -> dict:
         """Name your own list of prompts (up to 256) so that tools taking dev
@@ -592,7 +614,16 @@ def register_native_tools(box: ToolBox, ctx: ToolContext) -> None:
 
     def sample(prompts: Sequence[str], max_new_tokens: int = 64) -> list[str]:
         """Greedy completions for your own prompts with the current edits."""
-        return ctx.need_runner().generate(list(prompts), max_new_tokens)
+        texts = ctx.need_runner().generate(list(prompts), max_new_tokens)
+        if not ctx.withhold_harmful:
+            return texts
+        # in a run on harmful requests, an answer is shown only when it is a refusal or the prompt is a known safe one
+        safe = _cache.setdefault("safe_prompts", set(ctx.dev.benign) | {
+            it.prompt for st in ctx.dev.tasks.values() if st.kind in ("mrefusal", "refusal", "capability", "math")
+            for it in st.items})
+        refused = _refused(list(prompts), texts)
+        return [t if (r or p in safe) else f"[withheld: not a refusal, {len(t)} characters; the text is not shown in this run]"
+                for p, t, r in zip(prompts, texts, refused)]
 
     box.register("measure", dev_eval, cost=lambda n=32, sets=None, **_: {
         "forward_passes": 1, "dev_prompts": n * len(sets if sets is not None else ctx.dev.refusal_sets())}, timed=True)

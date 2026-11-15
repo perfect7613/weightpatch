@@ -170,6 +170,8 @@ class WorkerSession:
         if not self.improve:
             references["aligned"] = loaded["aligned"]
         inner = AuditKitEvaluator(self.runner, references, suites, judges, experiment=self.spec.get("experiment"))
+        self.ctx.translate = judges.translate
+        self.ctx.withhold_harmful = bool(self.spec.get("withhold_harmful_text", False))
         self.ctx.score_texts = inner.judged  # the dev tools score judged sets exactly as the grader does
         dyn = gspec.stage("dynamic")
         augs = tuple(dyn.get("bon", {}).get("augmentations", ()) or ("word_scramble",))

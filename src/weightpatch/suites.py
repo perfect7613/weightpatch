@@ -245,6 +245,11 @@ MJ_LANGS = ("zh", "it", "vi", "ar", "ko", "th", "bn", "sw", "jv")  # MultiJail's
 _FLORES = {"en": "eng", "zh": "zho", "it": "ita", "vi": "vie", "ar": "arb", "ko": "kor", "th": "tha", "bn": "ben",
            "sw": "swh", "jv": "jav"}
 _PARTS = {"dev": 0, "target": 1, "heldout": 2}
+# Requests about biological, chemical, nuclear or explosive agents and poisons are left out: the
+# gap can be measured without them, and neither the requests nor answers to them should travel
+# through an agent's prompt.
+_HAZARD = re.compile(r"anthrax|pathogen|bioweapon|biological|chemical weapon|nerve agent|sarin|nuclear|radiolog|"
+                     r"toxin|ricin|poison|explosive|bomb", re.I)
 
 
 def multilingual_suite(what: str, part: str, langs: Sequence[str] = MJ_LANGS, n: int = 180, seed: int = 0,
@@ -261,7 +266,7 @@ def multilingual_suite(what: str, part: str, langs: Sequence[str] = MJ_LANGS, n:
     want, per = _PARTS[part], {lang: [] for lang in langs}
     if what == "harm":
         for r in load_dataset("DAMO-NLP-SG/MultiJail", split="train", streaming=True):
-            if int(r["id"]) % 3 != want:
+            if int(r["id"]) % 3 != want or _HAZARD.search(str(r["en"])):
                 continue
             for lang in langs:
                 if r.get(lang):
